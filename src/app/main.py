@@ -332,3 +332,33 @@ async def vehicles(line_id: str = Query(..., description="TfL bus line id, e.g. 
 
     vehicles_out.sort(key=lambda v: v["eta_seconds"])
     return {"line_id": line_id, "fetched_at": fetched_at, "vehicles": vehicles_out}
+
+@app.get("/debug/ors")
+def debug_ors():
+    """Quick check that ORS token works from the server."""
+    import os, httpx
+    ORS_TOKEN = os.getenv("ORS_TOKEN")
+    if not ORS_TOKEN:
+        return {"ok": False, "reason": "ORS_TOKEN not set in environment"}
+
+    body = {
+        "coordinates": [[-0.1278, 51.5074], [-0.1, 51.51]],  # Westminster -> City-ish
+        "format": "geojson"
+    }
+    try:
+        r = httpx.post(
+            "https://api.openrouteservice.org/v2/directions/driving-car",
+            json=body,
+            headers={"Authorization": ORS_TOKEN},
+            timeout=20.0,
+        )
+        if r.status_code == 429:
+            return {"ok": False, "reason": "ORS quota exceeded (429)"}
+        r.raise_for_status()
+        feat = r.json()["features"][0]
+        n = len(feat["geometry"]["coordinates"])
+        return {"ok": True, "points": n}
+    except httpx.HTTPStatusError as e:
+        return {"ok": False, "reason": f"HTTP {e.response.status_code}", "body": (e.response.text or "")[:200]}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}

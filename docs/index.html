@@ -16,7 +16,6 @@
     .route-id { font-family: ui-monospace, Menlo, Consolas, monospace; width:56px; }
     .loading { font-size:12px; color:#888; }
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
-    /* optional: slight z-index bump so vehicles float above polylines */
     .leaflet-pane .vehicle-arrow { z-index: 500; }
   </style>
 </head>
@@ -28,9 +27,7 @@
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">
-        Tick routes to load vehicles. Map updates every 5s.
-      </div>
+      <div class="muted">Tick routes to load vehicles. Map updates every 5s.</div>
       <div class="muted" style="margin-bottom:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
         Stops are white dots with a colored ring. Buses are colored arrows pointing to their next stop.
@@ -64,22 +61,20 @@
       maxZoom: 19
     }).addTo(map);
 
-    // Color & math helpers
+    // Helpers
     const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
     const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
     const lerp = (a,b,t)=>a+(b-a)*t, clamp01=(x)=>Math.max(0,Math.min(1,x));
 
-    // Bearing (degrees) from point A(lat1,lon1) to B(lat2,lon2); 0° = north, clockwise positive
     function bearingDeg(lat1, lon1, lat2, lon2) {
       const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
       const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
       const y = Math.sin(Δλ) * Math.cos(φ2);
       const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-      let brng = toDeg(Math.atan2(y, x)); // -180..+180
-      return (brng + 360) % 360; // 0..360
+      let brng = toDeg(Math.atan2(y, x));
+      return (brng + 360) % 360;
     }
 
-    // Create a directional bus icon (CSS triangle) pointing "up" by default; rotate via inner wrapper
     function busIcon(color, rotationDeg) {
       const html =
         `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
@@ -91,12 +86,7 @@
              filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
            "></div>
          </div>`;
-      return L.divIcon({
-        className: 'bus-divicon',  // avoid Leaflet default icon styles
-        html,
-        iconSize: [20, 20],
-        iconAnchor: [10, 10] // center-ish
-      });
+      return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
     }
 
     async function fetchJSON(url) {
@@ -107,9 +97,9 @@
 
     function renderRoutes() {
       const q = (searchEl.value || "").trim().toLowerCase();
-      const filtered = q
-        ? allRoutes.filter(r => r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q))
-        : allRoutes;
+      const filtered = q ? allRoutes.filter(r =>
+        r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q)
+      ) : allRoutes;
 
       routesEl.innerHTML = "";
       filtered.slice(0, 300).forEach(r => {
@@ -117,10 +107,7 @@
         label.className = 'route-item';
 
         const swatch = document.createElement('span');
-        Object.assign(swatch.style, {
-          display: 'inline-block', width: '10px', height: '10px',
-          borderRadius: '50%', background: colorFor(r.id)
-        });
+        Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
 
         const cb = document.createElement('input');
         cb.type = 'checkbox';
@@ -131,43 +118,29 @@
           schedulePolling();
         });
 
-        const idSpan = document.createElement('span');
-        idSpan.className = 'route-id';
-        idSpan.textContent = r.id;
+        const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
+        const nameSpan = document.createElement('span'); nameSpan.textContent = r.name || r.id;
 
-        const nameSpan = document.createElement('span');
-        nameSpan.textContent = r.name || r.id;
-
-        label.appendChild(cb);
-        label.appendChild(swatch);
-        label.appendChild(idSpan);
-        label.appendChild(nameSpan);
+        label.appendChild(cb); label.appendChild(swatch); label.appendChild(idSpan); label.appendChild(nameSpan);
         routesEl.appendChild(label);
       });
 
       if (filtered.length > 300) {
-        const note = document.createElement('div');
-        note.className = 'muted';
-        note.textContent = 'Showing first 300. Refine your search.';
-        routesEl.appendChild(note);
+        const note = document.createElement('div'); note.className = 'muted'; note.textContent = 'Showing first 300. Refine your search.'; routesEl.appendChild(note);
       }
     }
 
-    function setStatus(msg, css = "loading") {
-      statusEl.className = css;
-      statusEl.textContent = msg;
-    }
+    function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
 
     function schedulePolling() {
       if (pollTimer) clearInterval(pollTimer);
+
       // remove lines no longer selected
-      for (const [lineId] of Array.from(lineLayers.entries())) {
+      for (const lineId of Array.from(lineLayers.keys())) {
         if (!selected.has(lineId)) removeRouteLayers(lineId);
       }
-      if (selected.size === 0) {
-        setStatus("No routes selected. Tick some on the left.", "muted");
-        return;
-      }
+
+      if (selected.size === 0) { setStatus("No routes selected. Tick some on the left.", "muted"); return; }
       setStatus("Live updating…", "muted");
       const load = () => updateVehicles(Array.from(selected));
       load();
@@ -177,7 +150,7 @@
     function removeRouteLayers(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
-      map.removeLayer(layers.group);
+      map.removeLayer(layers.group);   // removes polylines, stops, and vehicle markers
       lineLayers.delete(lineId);
     }
 
@@ -185,65 +158,50 @@
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
 
-      // Single container group for EVERYTHING on this route
       const group = L.layerGroup().addTo(map);
       const vehiclesState = new Map(); // key -> { marker, meta }
 
-      // 1) Road-following geometry
-      const shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
+      // 1) Road-following geometry (robust to empty/missing)
+      let shape = { inbound: [], outbound: [] };
+      try {
+        shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
+      } catch (e) {
+        console.warn("shape fetch failed for", lineId, e);
+      }
 
       const drawMulti = (multi, opts) => {
         const g = L.layerGroup();
         (multi || []).forEach(seg => {
-          if (Array.isArray(seg) && seg.length >= 2) {
-            L.polyline(seg, opts).addTo(g);
-          }
+          if (Array.isArray(seg) && seg.length >= 2) L.polyline(seg, opts).addTo(g);
         });
-        return g.addTo(group);
+        if (g.getLayers().length) g.addTo(group);
+        return g;
       };
 
-      const poly_in = drawMulti(shape.inbound, { color, weight: 4, opacity: 0.85 });
+      const poly_in  = drawMulti(shape.inbound,  { color, weight: 4, opacity: 0.85 });
       const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
 
-      // 2) Stops as standout rings
+      // 2) Stops (still draw even if shapes were empty)
       const seq = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => {
         (arr || []).forEach(sp => {
           if (sp.lat == null || sp.lon == null) return;
-          L.circleMarker([sp.lat, sp.lon], {
-            radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08
-          }).addTo(stopsLayer);
-          L.circleMarker([sp.lat, sp.lon], {
-            radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0
-          }).bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
+          L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
+          L.circleMarker([sp.lat, sp.lon], { radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
+            .bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
         });
       };
-      addStops(seq.inbound);
-      addStops(seq.outbound);
+      addStops(seq.inbound); addStops(seq.outbound);
 
-      // Stash everything so we can remove cleanly later
       lineLayers.set(lineId, { group, poly_in, poly_out, stops: stopsLayer, vehiclesState, color });
 
-      // Optional: fit to inbound bounds
+      // Fit bounds if we drew any shape
       let bounds = null;
-      if (poly_in && poly_in.eachLayer) {
-        poly_in.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
-      }
-      if (!bounds && poly_out && poly_out.eachLayer) {
-        poly_out.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
-      }
+      const collectBounds = (grp) => grp && grp.eachLayer && grp.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
+      collectBounds(poly_in); collectBounds(poly_out);
       if (bounds) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
     }
-
-    function removeRouteLayers(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      map.removeLayer(layers.group);   // removes polylines, stops, and vehicle markers
-      lineLayers.delete(lineId);
-    }
-
-
 
     async function updateVehicles(lines) {
       try {
@@ -261,7 +219,6 @@
       const { vehiclesState, color } = layers;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const fetchedAt = Date.parse(data.fetched_at || new Date().toISOString());
       const vehicles = data.vehicles || [];
       const seen = new Set();
 
@@ -273,10 +230,9 @@
         const hasNext = (v.next_lat != null && v.next_lon != null);
         if (!hasPrev && !hasNext) continue;
 
-        // pick two points for bearing & interpolation
         const pPrev = hasPrev ? [v.prev_lat, v.prev_lon] : [v.next_lat, v.next_lon];
         const pNext = hasNext ? [v.next_lat, v.next_lon] : [v.prev_lat, v.prev_lon];
-        const rot = bearingDeg(pPrev[0], pPrev[1], pNext[0], pNext[1]); // 0° = up
+        const rot = bearingDeg(pPrev[0], pPrev[1], pNext[0], pNext[1]);
 
         let st = vehiclesState.get(key);
         if (!st) {
@@ -290,7 +246,6 @@
           st = { marker: m, meta: {}, color };
           vehiclesState.set(key, st);
         } else {
-          // update heading icon if direction changed significantly
           st.marker.setIcon(busIcon(color, rot));
           st.marker.getPopup()?.setContent(
             `<b>Route:</b> ${v.route}<br>` +
@@ -300,7 +255,6 @@
           );
         }
 
-        // Interpolation meta for animation
         st.meta = {
           prev: pPrev,
           next: pNext,
@@ -329,7 +283,6 @@
           const lat = lerp(meta.prev[0], meta.next[0], p);
           const lon = lerp(meta.prev[1], meta.next[1], p);
           marker.setLatLng([lat, lon]);
-          // (rotation stays constant between polls; direction set on update)
         }
       }
     }, 100); // ~10fps
@@ -338,7 +291,7 @@
     searchEl.addEventListener('input', renderRoutes);
     clearBtn.addEventListener('click', () => {
       selected = new Set();
-      for (const [lineId] of lineLayers) removeRouteLayers(lineId);
+      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
       schedulePolling();
       for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
     });

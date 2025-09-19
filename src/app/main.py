@@ -169,76 +169,104 @@ async def line_stops(line_id: str):
 # =========================
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
-    """Return TfL 'lineStrings' geometry for a bus line (inbound/outbound), normalized to [[lat, lon], ...]."""
-
-    def build_raw():
+    """
+    Return TfL 'lineStrings' geometry for a bus line (inbound/outbound),
+    normalized to [[lat, lon], ...]. TfL can place lineStrings in a few
+    different spots; we check them all.
+    """
+    def fetch_raw():
         with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
             rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
             rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
             return rin.json(), rout.json()
 
-    try:
-        inbound_json, outbound_json = memo(f"rawseq:{line_id}", 300, build_raw)
+    inbound_json, outbound_json = memo(f"rawseq:{line_id}", 300, fetch_raw)
 
-        def extract_line_strings(seq_json):
-            lines: List[List[List[float]]] = []
-            for seq in (seq_json or {}).get("stopPointSequences", []):
-                raw_list = seq.get("lineStrings") or []
-                for raw in raw_list:
-                    if isinstance(raw, str):
-                        # "lat,lon lat,lon ..." -> [[lat, lon], ...]
-                        pts: List[List[float]] = []
-                        for token in raw.strip().split():
-                            parts = token.split(",")
-                            if len(parts) == 2:
-                                try:
-                                    lat = float(parts[0]); lon = float(parts[1])
-                                    pts.append([lat, lon])
-                                except ValueError:
-                                    continue
-                        if len(pts) >= 2:
-                            lines.append(pts)
-                    elif isinstance(raw, list):
-                        # [[a,b], [a,b], ...] but may be [lon,lat]. Heuristic swap if needed.
-                        pts: List[List[float]] = []
-                        ok = True
-                        for p in raw:
-                            if not (isinstance(p, (list, tuple)) and len(p) == 2):
-                                ok = False; break
-                            a, b = p
-                            try:
-                                a = float(a); b = float(b)
-                            except (TypeError, ValueError):
-                                ok = False; break
-                            pts.append([a, b])
-                        if ok and len(pts) >= 2:
-                            a0, b0 = pts[0]
-                            looks_lonlat = (-1.5 <= a0 <= 0.5) and (50.0 <= b0 <= 52.5)  # London-ish
-                            if looks_lonlat:
-                                pts = [[p[1], p[0]] for p in pts]
-                            lines.append(pts)
-            return lines
+    def parse_line_strings(container: Dict[str, Any]) -> List[List[List[float]]]:
+        """
+        Collect all polylines from several possible locations:
+          - container["lineStrings"]  (top-level)
+          - each s in container["stopPointSequences"]: s["lineStrings"]
+          - each r in container["orderedLineRoutes"]: r["lineStrings"]
+        Normalize to [[lat, lon], ...] lists.
+        """
+        out: List[List[List[float]]] = []
 
-        inbound = extract_line_strings(inbound_json)
-        outbound = extract_line_strings(outbound_json)
+        def normalize_one(raw) -> Optional[List[List[float]]]:
+            # raw can be a string "lat,lon lat,lon ..." OR a list of [a,b] pairs (either [lat,lon] or [lon,lat])
+            if isinstance(raw, str):
+                pts: List[List[float]] = []
+                for token in raw.strip().split():
+                    parts = token.split(",")
+                    if len(parts) != 2:
+                        continue
+                    try:
+                        a = float(parts[0]); b = float(parts[1])
+                    except ValueError:
+                        continue
+                    pts.append([a, b])
+                return pts if len(pts) >= 2 else None
 
-        def dedupe(lines: List[List[List[float]]]):
-            seen = set(); out = []
-            for pts in lines:
-                key = (len(pts),
-                       round(pts[0][0], 5), round(pts[0][1], 5),
-                       round(pts[-1][0], 5), round(pts[-1][1], 5))
-                if key in seen: continue
-                seen.add(key); out.append(pts)
-            return out
+            if isinstance(raw, list) and raw and isinstance(raw[0], (list, tuple)) and len(raw[0]) == 2:
+                pts: List[List[float]] = []
+                for p in raw:
+                    try:
+                        a = float(p[0]); b = float(p[1])
+                    except (TypeError, ValueError):
+                        return None
+                    pts.append([a, b])
+                if len(pts) < 2:
+                    return None
+                # Heuristic: if first looks like [lon, lat] (London lon ≈ -1.5..0.5, lat ≈ 50..52.5), swap.
+                a0, b0 = pts[0]
+                looks_lonlat = (-1.5 <= a0 <= 0.5) and (50.0 <= b0 <= 52.5)
+                if looks_lonlat:
+                    pts = [[p[1], p[0]] for p in pts]
+                return pts
 
-        return {"line_id": line_id, "inbound": dedupe(inbound), "outbound": dedupe(outbound)}
+            return None
 
-    except httpx.HTTPStatusError as e:
-        txt = (e.response.text or "")[:400]
-        raise HTTPException(status_code=502, detail=f"TfL HTTP {e.response.status_code}: {txt}")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"TfL request failed: {e}")
+        def collect_from_key(obj: Dict[str, Any], key: str):
+            for raw in obj.get(key) or []:
+                pts = normalize_one(raw)
+                if pts:
+                    out.append(pts)
+
+        # Top-level
+        collect_from_key(container, "lineStrings")
+
+        # From stopPointSequences[*].lineStrings
+        for s in container.get("stopPointSequences") or []:
+            collect_from_key(s, "lineStrings")
+
+        # From orderedLineRoutes[*].lineStrings (seen on some modes)
+        for r in container.get("orderedLineRoutes") or []:
+            collect_from_key(r, "lineStrings")
+
+        return out
+
+    inbound_lines = parse_line_strings(inbound_json)
+    outbound_lines = parse_line_strings(outbound_json)
+
+    # Deduplicate near-duplicates (length + endpoints)
+    def dedupe(lines: List[List[List[float]]]) -> List[List[List[float]]]:
+        seen = set(); result = []
+        for pts in lines:
+            key = (len(pts),
+                   round(pts[0][0], 5), round(pts[0][1], 5),
+                   round(pts[-1][0], 5), round(pts[-1][1], 5))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(pts)
+        return result
+
+    return {
+        "line_id": line_id,
+        "inbound": dedupe(inbound_lines),
+        "outbound": dedupe(outbound_lines),
+    }
+
 
 # =========================
 # Vehicles with prev/next stop for interpolation

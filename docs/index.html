@@ -133,19 +133,44 @@
     function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
 
     function schedulePolling() {
-      if (pollTimer) clearInterval(pollTimer);
+      // stop any existing poller
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
 
-      // remove lines no longer selected
+      // remove any route layers that are no longer selected
       for (const lineId of Array.from(lineLayers.keys())) {
         if (!selected.has(lineId)) removeRouteLayers(lineId);
       }
 
-      if (selected.size === 0) { setStatus("No routes selected. Tick some on the left.", "muted"); return; }
+      // if nothing selected, nuke everything & update status
+      if (selected.size === 0) {
+        // double-ensure cleanup (in case something slipped through)
+        for (const lineId of Array.from(lineLayers.keys())) {
+          removeRouteLayers(lineId);
+        }
+        setStatus("No routes selected. Tick some on the left.", "muted");
+        return;
+      }
+
       setStatus("Live updating…", "muted");
-      const load = () => updateVehicles(Array.from(selected));
+
+      // take a snapshot of the current selection for this tick
+      const load = async () => {
+        const lines = Array.from(selected);
+        try {
+          await updateVehicles(lines);
+        } catch (e) {
+          setStatus("Error: " + e.message, "error");
+        }
+      };
+
+      // run immediately, then every 5s
       load();
       pollTimer = setInterval(load, 5000);
     }
+
 
     function removeRouteLayers(lineId) {
       const layers = lineLayers.get(lineId);

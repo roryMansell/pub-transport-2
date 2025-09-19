@@ -176,22 +176,20 @@ ORS_TOKEN = os.getenv("ORS_TOKEN")
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
-    Road-following shape using ORS Directions with 24h cache.
-    Adds meta.source = 'ors' or 'fallback'.
+    Road-following shape using ORS Directions (no cache, always fresh).
     """
     import httpx
 
     ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
     ORS_TOKEN = os.getenv("ORS_TOKEN")
 
-    # 1) Fetch ordered stops (cache 10 min)
-    def build_raw():
-        with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
-            r_in = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); r_in.raise_for_status()
-            r_out = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); r_out.raise_for_status()
-            return r_in.json(), r_out.json()
-
-    inbound_json, outbound_json = memo(f"rawstops:{line_id}", 600, build_raw)
+    # 1) Fetch ordered stops (no cache)
+    async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as c:
+        r_in = await c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params())
+        r_out = await c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params())
+        r_in.raise_for_status()
+        r_out.raise_for_status()
+        inbound_json, outbound_json = r_in.json(), r_out.json()
 
     def simplify(seq_json):
         pts = []
@@ -204,47 +202,31 @@ async def line_shape(line_id: str):
     inbound_pts = simplify(inbound_json)
     outbound_pts = simplify(outbound_json)
 
-    # -----------------------------
-    # Fixed ORS routing subfunction
-    # -----------------------------
-    def ors_route_sync(points, cache_key):
+    async def ors_route(points):
         if len(points) < 2 or not ORS_TOKEN:
             return [], ("no-token" if not ORS_TOKEN else "too-few-points")
 
-        def build():
-            coords = [[lon, lat] for lat, lon in points]
-            if len(coords) > 50:  # ORS hard limit ~50
-                step = max(1, len(coords) // 49)
-                coords = coords[::step] + [coords[-1]]
+        coords = [[lon, lat] for lat, lon in points]
+        if len(coords) > 50:  # ORS limit
+            step = max(1, len(coords) // 49)
+            coords = coords[::step] + [coords[-1]]
 
-            body = {
-                "coordinates": coords,
-                "geometry_format": "geojson"
-            }
-            headers = {"Authorization": ORS_TOKEN}
+        body = {"coordinates": coords, "geometry_format": "geojson"}
+        headers = {"Authorization": ORS_TOKEN}
 
-            with httpx.Client(timeout=30.0) as c:
-                r = c.post(ORS_BASE, json=body, headers=headers)
-                if r.status_code == 429:
-                    return []  # quota hit
-                r.raise_for_status()
-                data = r.json()
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(ORS_BASE, json=body, headers=headers)
+            if r.status_code == 429:
+                return [], "quota"
+            r.raise_for_status()
+            data = r.json()
 
-            # geometry is now a dict with coordinates
-            geo = data["routes"][0]["geometry"]["coordinates"]  # [[lon,lat],...]
-            return [[lat, lon] for lon, lat in geo]
+        geo = data["routes"][0]["geometry"]["coordinates"]
+        return [[lat, lon] for lon, lat in geo], "ors"
 
-        try:
-            shape = memo(cache_key, 86400, build)  # cache only good result
-            return shape, "ors"
-        except Exception as e:
-            return [], str(e)
+    in_shape, in_src = await ors_route(inbound_pts)
+    out_shape, out_src = await ors_route(outbound_pts)
 
-    # Run both directions
-    in_shape, in_src = ors_route_sync(inbound_pts, f"ors:shape:{line_id}:in")
-    out_shape, out_src = ors_route_sync(outbound_pts, f"ors:shape:{line_id}:out")
-
-    # Fallback straight lines if ORS fails
     if not in_shape and inbound_pts:
         in_shape, in_src = inbound_pts, "fallback"
     if not out_shape and outbound_pts:
@@ -256,6 +238,7 @@ async def line_shape(line_id: str):
         "outbound": [out_shape] if out_shape else [],
         "meta": {"in_source": in_src, "out_source": out_src}
     }
+
 
 
 

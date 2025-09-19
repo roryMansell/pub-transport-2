@@ -407,3 +407,13 @@ def debug_ors():
         return out
     except Exception as e:
         return {"ok": False, "reason": str(e)}
+
+@app.get("/debug/ors-route")
+async def debug_ors_route():
+    import httpx
+    coords = [[-0.10355, 51.42952], [-0.16276, 51.5223]]  # start+end of route 2 inbound
+    headers = {"Authorization": ORS_TOKEN}
+    body = {"coordinates": coords, "format": "geojson"}
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(ORS_BASE, json=body, headers=headers)
+        return {"status": r.status_code, "json": r.json()}

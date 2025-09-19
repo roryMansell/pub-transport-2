@@ -184,25 +184,37 @@
     async function ensureRouteLoaded(lineId) {
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
+
+      // base group for this route
       const group = L.layerGroup().addTo(map);
-      const vehiclesState = new Map(); // key -> { marker, meta, color }
+      const vehiclesState = new Map(); // key -> { marker, meta }
 
+      // 1) Fetch the road-following geometry (new endpoint)
+      const shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
+
+      // Helper to draw multi-segment polylines
+      const drawMulti = (multi, opts) => {
+        const g = L.layerGroup();
+        (multi || []).forEach(seg => {
+          // seg is [[lat, lon], [lat, lon], ...]
+          if (Array.isArray(seg) && seg.length >= 2) {
+            L.polyline(seg, opts).addTo(g);
+          }
+        });
+        return g.addTo(group);
+      };
+
+      // 2) Draw inbound (solid) and outbound (dashed) shapes
+      const poly_in = drawMulti(shape.inbound, { color, weight: 4, opacity: 0.85 });
+      const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
+
+      // 3) Fetch stops so they stand out above the line (same as before)
       const seq = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
-      const toLatLngs = (arr) => arr.filter(s => s.lat != null && s.lon != null).map(s => [s.lat, s.lon]);
-
-      const inboundLL = toLatLngs(seq.inbound || []);
-      const outboundLL = toLatLngs(seq.outbound || []);
-
-      // route polylines (inbound solid, outbound dashed)
-      const poly_in = inboundLL.length ? L.polyline(inboundLL, { color, weight: 4, opacity: 0.85 }).addTo(group) : null;
-      const poly_out = outboundLL.length ? L.polyline(outboundLL, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group) : null;
-
-      // STOP ICONS: white-fill ring with colored stroke, slightly larger to stand out
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => {
-        arr.forEach(sp => {
+        (arr || []).forEach(sp => {
           if (sp.lat == null || sp.lon == null) return;
-          // halo (subtle) behind
+          // halo
           L.circleMarker([sp.lat, sp.lon], {
             radius: 6, color: '#0000', weight: 0, fillColor: '#000',
             fillOpacity: 0.08
@@ -211,19 +223,47 @@
           L.circleMarker([sp.lat, sp.lon], {
             radius: 5,
             color: color,
-            weight: 3,        // thicker ring
-            fillColor: '#fff', // white center
+            weight: 3,
+            fillColor: '#fff',
             fillOpacity: 1.0
           }).bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
         });
       };
-      addStops(seq.inbound || []);
-      addStops(seq.outbound || []);
+      addStops(seq.inbound);
+      addStops(seq.outbound);
 
+      // Save into our per-route registry
       lineLayers.set(lineId, { group, poly_in, poly_out, stops: stopsLayer, vehiclesState, color });
-      // Optional: zoom to bounds when first added
-      if (poly_in) map.fitBounds(poly_in.getBounds(), { padding: [20,20], maxZoom: 14 });
+
+      // Optional: zoom to the inbound shape if present
+      // Try to get bounds from one of the polylines in the inbound layer
+      let fitted = false;
+      if (poly_in && poly_in.eachLayer) {
+        let bounds = null;
+        poly_in.eachLayer(l => {
+          if (l.getBounds) {
+            bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
+          }
+        });
+        if (bounds) {
+          map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
+          fitted = true;
+        }
+      }
+      // Fallback to outbound if inbound had no bounds
+      if (!fitted && poly_out && poly_out.eachLayer) {
+        let bounds = null;
+        poly_out.eachLayer(l => {
+          if (l.getBounds) {
+            bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
+          }
+        });
+        if (bounds) {
+          map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
+        }
+      }
     }
+
 
     async function updateVehicles(lines) {
       try {

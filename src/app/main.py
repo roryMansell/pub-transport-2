@@ -9,6 +9,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+
+from datetime import datetime, timezone
+
 from .models import Arrival, ArrivalsResponse
 
 # -------------------------
@@ -144,9 +147,62 @@ async def line_stops(line_id: str):
 
     return {"line_id": line_id, "inbound": simplify(inbound), "outbound": simplify(outbound)}
 
-from datetime import datetime, timezone
+@app.get("/line/{line_id}/shape")
+async def line_shape(line_id: str):
+    """Return TfL 'lineStrings' geometry for a bus line (inbound/outbound)."""
+    def build():
+        with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
+            rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
+            rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
+            return rin.json(), rout.json()
 
-from datetime import datetime, timezone
+    inbound_json, outbound_json = memo(f"rawseq:{line_id}", 300, build)
+
+    def extract_line_strings(seq_json):
+        # TfL returns lineStrings as arrays of "lat,lon lat,lon ..." or arrays of [lat,lon] pairs depending on mode/version.
+        # We’ll normalize to [[lat, lon], ...] arrays for Leaflet.
+        ls = []
+        for s in seq_json.get("stopPointSequences", []):
+            for raw in s.get("lineStrings", []) or []:
+                if isinstance(raw, str):
+                    # "lat,lon lat,lon ..." -> split -> floats
+                    pts = []
+                    for token in raw.strip().split(" "):
+                        if not token: continue
+                        latlon = token.split(",")
+                        if len(latlon) == 2:
+                            lat = float(latlon[0]); lon = float(latlon[1])
+                            pts.append([lat, lon])
+                    if len(pts) >= 2:
+                        ls.append(pts)
+                elif isinstance(raw, list):
+                    # [[lat,lon], [lat,lon], ...] OR [[lon,lat], ...] -> detect order
+                    if len(raw) >= 2 and len(raw[0]) == 2:
+                        # simple heuristic: London lon ~ -0.x to -0.6; lat ~ 51.x
+                        a, b = raw[0]
+                        looks_latlon = (50 <= a <= 52) and (-1.5 <= b <= 0.5)
+                        pts = [[p[0], p[1]] if looks_latlon else [p[1], p[0]] for p in raw]
+                        ls.append(pts)
+        return ls
+
+    inbound = extract_line_strings(inbound_json)
+    outbound = extract_line_strings(outbound_json)
+
+    # Deduplicate very-similar lines (simple length-based heuristic)
+    def dedupe(lines):
+        seen = set(); out = []
+        for pts in lines:
+            key = (len(pts), round(pts[0][0], 5), round(pts[0][1], 5), round(pts[-1][0], 5), round(pts[-1][1], 5))
+            if key in seen: continue
+            seen.add(key); out.append(pts)
+        return out
+
+    return {
+        "line_id": line_id,
+        "inbound": dedupe(inbound),
+        "outbound": dedupe(outbound),
+    }
+
 
 @app.get("/vehicles")
 async def vehicles(line_id: str = Query(..., description="TfL bus line id, e.g. 88")):

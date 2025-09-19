@@ -176,11 +176,9 @@ ORS_TOKEN = os.getenv("ORS_TOKEN")
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
-    Road-following shape using OpenRouteService Directions (no cache while debugging).
-    Ensures <= 50 waypoints per ORS call. Returns 'meta' with source or error.
+    Road-following shape using ORS Directions (no cache).
+    Falls back to straight stops if ORS fails.
     """
-    import os, httpx
-
     ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
     ORS_TOKEN = os.getenv("ORS_TOKEN")
 
@@ -193,20 +191,6 @@ async def line_shape(line_id: str):
                     pts.append((float(lat), float(lon)))
         return pts
 
-    def downsample_to_max(coords, max_n=50):
-        n = len(coords)
-        if n <= max_n:
-            return coords
-        out = []
-        for k in range(max_n):
-            idx = round(k * (n - 1) / (max_n - 1))
-            out.append(coords[idx])
-        dedup = [out[0]]
-        for p in out[1:]:
-            if p != dedup[-1]:
-                dedup.append(p)
-        return dedup
-
     async def fetch_seq(direction: str):
         url = f"{TFL_BASE}/Line/{line_id}/Route/Sequence/{direction}"
         async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as c:
@@ -217,6 +201,27 @@ async def line_shape(line_id: str):
     inbound_json, outbound_json = await fetch_seq("inbound"), await fetch_seq("outbound")
     inbound_pts, outbound_pts = simplify(inbound_json), simplify(outbound_json)
 
+    def decode_polyline(enc):
+        """Decode ORS encoded polyline to [[lat, lon], ...]."""
+        coords, index, lat, lon = [], 0, 0, 0
+        while index < len(enc):
+            shift, result = 0, 0
+            while True:
+                b = ord(enc[index]) - 63; index += 1
+                result |= (b & 0x1f) << shift; shift += 5
+                if b < 0x20: break
+            dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+            lat += dlat
+            shift, result = 0, 0
+            while True:
+                b = ord(enc[index]) - 63; index += 1
+                result |= (b & 0x1f) << shift; shift += 5
+                if b < 0x20: break
+            dlon = ~(result >> 1) if (result & 1) else (result >> 1)
+            lon += dlon
+            coords.append([lat / 1e5, lon / 1e5])
+        return coords
+
     async def ors_route(points_latlon):
         if len(points_latlon) < 2:
             return [], "too-few-points"
@@ -224,13 +229,7 @@ async def line_shape(line_id: str):
             return [], "no-token"
 
         coords = [[lon, lat] for (lat, lon) in points_latlon]
-        coords = downsample_to_max(coords, 50)
-
-        body = {
-            "coordinates": coords,
-            "instructions": False,  # we don’t need turn-by-turn
-            "geometry": True,       # default anyway
-        }
+        body = {"coordinates": coords, "instructions": False}
         headers = {"Authorization": ORS_TOKEN, "Content-Type": "application/json"}
 
         async with httpx.AsyncClient(timeout=30.0) as c:
@@ -238,30 +237,18 @@ async def line_shape(line_id: str):
 
         if r.status_code == 429:
             return [], "quota"
-        if r.status_code == 400:
-            try:
-                j = r.json()
-                msg = j.get("error", {}).get("message") or str(j)[:200]
-            except Exception:
-                msg = (r.text or "")[:200]
-            return [], f"bad-request:{msg}"
+        if r.status_code >= 400:
+            return [], f"bad-request:{r.text[:120]}"
 
-        r.raise_for_status()
         data = r.json()
-
-        # ORS v2 returns geometry in `routes[0].geometry`
         geom = data.get("routes", [{}])[0].get("geometry")
-        coords_lonlat = None
+
         if isinstance(geom, dict) and "coordinates" in geom:
-            coords_lonlat = geom["coordinates"]  # already [[lon,lat],...]
+            return [[lat, lon] for lon, lat in geom["coordinates"]], "ors-geojson"
         elif isinstance(geom, str):
-            # TODO: decode polyline if needed
-            return [], "encoded-polyline"
-
-        if not coords_lonlat:
-            return [], "no-geometry"
-
-        return [[lat, lon] for lon, lat in coords_lonlat], "ors"
+            coords = decode_polyline(geom)
+            return coords, "ors-polyline"
+        return [], "no-geometry"
 
     in_shape, in_src = await ors_route(inbound_pts)
     out_shape, out_src = await ors_route(outbound_pts)

@@ -95,12 +95,33 @@ def memo(key: str, ttl: int, builder):
 
 @app.get("/routes")
 async def routes():
-    """List all bus lines (id + name) from TfL."""
-    async with httpx.AsyncClient(timeout=15.0, headers=HTTP_HEADERS) as client:
-        r = await client.get(f"{TFL_BASE}/Line/Mode/bus", params=tfl_params())
-        r.raise_for_status()
-        data = r.json()
-    return [{"id": x["id"], "name": x.get("name", x["id"])} for x in data]
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=HTTP_HEADERS) as client:
+            r = await client.get(f"{TFL_BASE}/Line/Mode/bus", params=tfl_params())
+            r.raise_for_status()
+            data = r.json()
+        return [{"id": x["id"], "name": x.get("name", x["id"])} for x in data]
+    except httpx.HTTPStatusError as e:
+        # Show TfL error details (most common: 401/403/429)
+        txt = (e.response.text or "")[:500]
+        raise HTTPException(status_code=502, detail=f"TfL HTTP {e.response.status_code}: {txt}")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"TfL request failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+@app.get("/debug/tfl")
+async def debug_tfl():
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=HTTP_HEADERS) as client:
+            r = await client.get(f"{TFL_BASE}/Line/Mode/bus", params=tfl_params())
+            status = r.status_code
+            ok = r.status_code == 200
+            count = len(r.json()) if ok else None
+            return {"ok": ok, "status": status, "count": count}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 @app.get("/line/{line_id}/stops")
 async def line_stops(line_id: str):

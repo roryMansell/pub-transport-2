@@ -185,18 +185,16 @@
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
 
-      // base group for this route
+      // Single container group for EVERYTHING on this route
       const group = L.layerGroup().addTo(map);
       const vehiclesState = new Map(); // key -> { marker, meta }
 
-      // 1) Fetch the road-following geometry (new endpoint)
+      // 1) Road-following geometry
       const shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
 
-      // Helper to draw multi-segment polylines
       const drawMulti = (multi, opts) => {
         const g = L.layerGroup();
         (multi || []).forEach(seg => {
-          // seg is [[lat, lon], [lat, lon], ...]
           if (Array.isArray(seg) && seg.length >= 2) {
             L.polyline(seg, opts).addTo(g);
           }
@@ -204,65 +202,47 @@
         return g.addTo(group);
       };
 
-      // 2) Draw inbound (solid) and outbound (dashed) shapes
       const poly_in = drawMulti(shape.inbound, { color, weight: 4, opacity: 0.85 });
       const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
 
-      // 3) Fetch stops so they stand out above the line (same as before)
+      // 2) Stops as standout rings
       const seq = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => {
         (arr || []).forEach(sp => {
           if (sp.lat == null || sp.lon == null) return;
-          // halo
           L.circleMarker([sp.lat, sp.lon], {
-            radius: 6, color: '#0000', weight: 0, fillColor: '#000',
-            fillOpacity: 0.08
+            radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08
           }).addTo(stopsLayer);
-          // main ring
           L.circleMarker([sp.lat, sp.lon], {
-            radius: 5,
-            color: color,
-            weight: 3,
-            fillColor: '#fff',
-            fillOpacity: 1.0
+            radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0
           }).bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
         });
       };
       addStops(seq.inbound);
       addStops(seq.outbound);
 
-      // Save into our per-route registry
+      // Stash everything so we can remove cleanly later
       lineLayers.set(lineId, { group, poly_in, poly_out, stops: stopsLayer, vehiclesState, color });
 
-      // Optional: zoom to the inbound shape if present
-      // Try to get bounds from one of the polylines in the inbound layer
-      let fitted = false;
+      // Optional: fit to inbound bounds
+      let bounds = null;
       if (poly_in && poly_in.eachLayer) {
-        let bounds = null;
-        poly_in.eachLayer(l => {
-          if (l.getBounds) {
-            bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
-          }
-        });
-        if (bounds) {
-          map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
-          fitted = true;
-        }
+        poly_in.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
       }
-      // Fallback to outbound if inbound had no bounds
-      if (!fitted && poly_out && poly_out.eachLayer) {
-        let bounds = null;
-        poly_out.eachLayer(l => {
-          if (l.getBounds) {
-            bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
-          }
-        });
-        if (bounds) {
-          map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
-        }
+      if (!bounds && poly_out && poly_out.eachLayer) {
+        poly_out.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
       }
+      if (bounds) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
     }
+
+    function removeRouteLayers(lineId) {
+      const layers = lineLayers.get(lineId);
+      if (!layers) return;
+      map.removeLayer(layers.group);   // removes polylines, stops, and vehicle markers
+      lineLayers.delete(lineId);
+    }
+
 
 
     async function updateVehicles(lines) {

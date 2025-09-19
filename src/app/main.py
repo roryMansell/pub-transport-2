@@ -179,61 +179,64 @@ ORS_TOKEN = os.getenv("ORS_TOKEN")
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
-    Road-following shape using ORS Directions.
-    If ORS fails, falls back to straight stop-to-stop lines.
+    Road-following shape using ORS Directions (no cache).
+    Falls back to straight stops if ORS fails.
     """
-
-    import httpx, os, logging
-    from typing import List, Tuple
-
-    logger = logging.getLogger("uvicorn.error")
     ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
     ORS_TOKEN = os.getenv("ORS_TOKEN")
 
-    # --- Fetch ordered stops from TfL ---
-    async def fetch_seq():
-        async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as c:
-            rin = await c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params())
-            rout = await c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params())
-            rin.raise_for_status(); rout.raise_for_status()
-            return rin.json(), rout.json()
-
-    inbound_json, outbound_json = await fetch_seq()
-
     def simplify(seq_json):
-        pts: List[Tuple[float, float]] = []
+        pts = []
         for s in (seq_json or {}).get("stopPointSequences", []):
             for sp in s.get("stopPoint", []):
-                if sp.get("lat") is not None and sp.get("lon") is not None:
-                    pts.append((float(sp["lat"]), float(sp["lon"])))
+                lat, lon = sp.get("lat"), sp.get("lon")
+                if lat is not None and lon is not None:
+                    pts.append((float(lat), float(lon)))
         return pts
 
-    inbound_pts  = simplify(inbound_json)
-    outbound_pts = simplify(outbound_json)
+    async def fetch_seq(direction: str):
+        url = f"{TFL_BASE}/Line/{line_id}/Route/Sequence/{direction}"
+        async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as c:
+            r = await c.get(url, params=tfl_params())
+            r.raise_for_status()
+            return r.json()
 
-    # --- ORS call helper ---
-    async def ors_route(points_latlon, label: str):
+    inbound_json, outbound_json = await fetch_seq("inbound"), await fetch_seq("outbound")
+    inbound_pts, outbound_pts = simplify(inbound_json), simplify(outbound_json)
+
+    def decode_polyline(enc):
+        """Decode ORS encoded polyline to [[lat, lon], ...]."""
+        coords, index, lat, lon = [], 0, 0, 0
+        while index < len(enc):
+            shift, result = 0, 0
+            while True:
+                b = ord(enc[index]) - 63; index += 1
+                result |= (b & 0x1f) << shift; shift += 5
+                if b < 0x20: break
+            dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+            lat += dlat
+            shift, result = 0, 0
+            while True:
+                b = ord(enc[index]) - 63; index += 1
+                result |= (b & 0x1f) << shift; shift += 5
+                if b < 0x20: break
+            dlon = ~(result >> 1) if (result & 1) else (result >> 1)
+            lon += dlon
+            coords.append([lat / 1e5, lon / 1e5])
+        return coords
+
+    async def ors_route(points_latlon):
         if len(points_latlon) < 2:
             return [], "too-few-points"
         if not ORS_TOKEN:
             return [], "no-token"
 
         coords = [[lon, lat] for (lat, lon) in points_latlon]
-        if len(coords) > 50:  # ORS waypoint limit
-            step = max(1, len(coords) // 49)
-            coords = coords[::step] + [coords[-1]]
-
         body = {"coordinates": coords, "instructions": False}
         headers = {"Authorization": ORS_TOKEN, "Content-Type": "application/json"}
 
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post(ORS_BASE, json=body, headers=headers)
-
-        # Debug log
-        try:
-            logger.info("ORS %s response (status %s): %s", label, r.status_code, r.text[:500])
-        except Exception as e:
-            logger.warning("Failed to log ORS response for %s: %s", label, e)
 
         if r.status_code == 429:
             return [], "quota"
@@ -244,21 +247,15 @@ async def line_shape(line_id: str):
         geom = data.get("routes", [{}])[0].get("geometry")
 
         if isinstance(geom, dict) and "coordinates" in geom:
-            coords = [[lat, lon] for lon, lat in geom["coordinates"]]
-            return coords, "ors-geojson"
+            return [[lat, lon] for lon, lat in geom["coordinates"]], "ors-geojson"
         elif isinstance(geom, str):
-            from openrouteservice import convert
-            coords = convert.decode_polyline(geom)["coordinates"]
-            coords = [[lat, lon] for lon, lat in coords]
+            coords = decode_polyline(geom)
             return coords, "ors-polyline"
-        else:
-            return [], "no-geometry"
+        return [], "no-geometry"
 
-    # --- Try inbound/outbound via ORS ---
-    in_shape, in_src = await ors_route(inbound_pts, "inbound")
-    out_shape, out_src = await ors_route(outbound_pts, "outbound")
+    in_shape, in_src = await ors_route(inbound_pts)
+    out_shape, out_src = await ors_route(outbound_pts)
 
-    # Fallback: straight stop-to-stop lines
     if not in_shape and inbound_pts:
         in_shape, in_src = inbound_pts, "fallback"
     if not out_shape and outbound_pts:
@@ -270,7 +267,6 @@ async def line_shape(line_id: str):
         "outbound": [out_shape] if out_shape else [],
         "meta": {"in_source": in_src, "out_source": out_src}
     }
-
 
 
 

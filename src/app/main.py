@@ -172,22 +172,22 @@ async def line_stops(line_id: str):
 
 ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
 ORS_TOKEN = os.getenv("ORS_TOKEN")
+
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
     Road-following shape using ORS Directions with 24h cache.
-    Adds meta.source = 'ors' or 'fallback'.
+    Adds meta.in_source/out_source = 'ors' | 'fallback' | reason.
     """
-    import os, httpx
-    ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
-    ORS_TOKEN = os.getenv("ORS_TOKEN")
+    import httpx
 
-    # 1) Fetch ordered stops (cache 10 min)
+    # 1) Fetch ordered stops (cache ~10 min)
     def build_raw():
         with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
             r_in = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); r_in.raise_for_status()
             r_out = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); r_out.raise_for_status()
             return r_in.json(), r_out.json()
+
     inbound_json, outbound_json = memo(f"rawstops:{line_id}", 600, build_raw)
 
     def simplify(seq_json):
@@ -195,46 +195,73 @@ async def line_shape(line_id: str):
         for s in (seq_json or {}).get("stopPointSequences", []):
             for sp in s.get("stopPoint", []):
                 if sp.get("lat") is not None and sp.get("lon") is not None:
-                    pts.append((float(sp["lat"]), float(sp["lon"])))
+                    pts.append((float(sp["lat"]), float(sp["lon"])))  # (lat, lon)
         return pts
 
     inbound_pts  = simplify(inbound_json)
     outbound_pts = simplify(outbound_json)
 
     def ors_route_sync(points, cache_key):
-        if len(points) < 2 or not ORS_TOKEN:
-            return [], ("no-token" if not ORS_TOKEN else "too-few-points")
+        if len(points) < 2:
+            return [], "too-few-points"
+        if not ORS_TOKEN:
+            return [], "no-token"
 
         def build():
+            # ORS expects [lon, lat]
             coords = [[lon, lat] for lat, lon in points]
-            # ORS limit ~50 waypoints/request; thin if needed
+
+            # ORS free plan: max ~50 waypoints per request → thin if needed
             if len(coords) > 50:
-                step = max(1, len(coords) // 49)
+                step = max(1, len(coords) // 49)  # keep start + ≤49
                 coords = coords[::step] + [coords[-1]]
-            body = {"coordinates": coords, "format": "geojson"}
+
+            body = {
+                "coordinates": coords,
+                # Even if we ask for GeoJSON, ORS can return "routes" shape; we'll handle both.
+                "format": "geojson"
+            }
             headers = {"Authorization": ORS_TOKEN}
+
             with httpx.Client(timeout=30.0) as c:
                 r = c.post(ORS_BASE, json=body, headers=headers)
                 if r.status_code == 429:
-                    # quota hit → signal empty so we fallback
+                    # Quota exceeded → force fallback
                     return []
                 r.raise_for_status()
                 data = r.json()
-            geo = data["features"][0]["geometry"]["coordinates"]  # [[lon,lat],...]
-            return [[lat, lon] for lon, lat in geo]
+
+            # --- Accept BOTH possible ORS response shapes ---
+            coords_lonlat = None
+            if isinstance(data, dict):
+                # GeoJSON style
+                if "features" in data and data["features"]:
+                    coords_lonlat = data["features"][0]["geometry"]["coordinates"]
+                # Non-GeoJSON style
+                elif "routes" in data and data["routes"]:
+                    geom = data["routes"][0].get("geometry")
+                    # Could be dict with coordinates OR already a list
+                    if isinstance(geom, dict) and "coordinates" in geom:
+                        coords_lonlat = geom["coordinates"]
+                    elif isinstance(geom, list):
+                        coords_lonlat = geom
+            if not coords_lonlat:
+                return []
+
+            # Normalize to [[lat, lon], ...]
+            return [[lat, lon] for lon, lat in coords_lonlat]
 
         try:
             shape = memo(cache_key, 86400, build)  # 24h cache
-            return shape, "ors"
+            # If cached build returned [], treat as failure so we can fallback
+            return (shape, "ors") if shape else ([], "empty")
         except httpx.HTTPStatusError as e:
             return [], f"http {e.response.status_code}"
         except Exception as e:
             return [], str(e)
 
-    in_shape, in_src  = ors_route_sync(inbound_pts,  f"ors:shape:{line_id}:in")
+    in_shape,  in_src  = ors_route_sync(inbound_pts,  f"ors:shape:{line_id}:in")
     out_shape, out_src = ors_route_sync(outbound_pts, f"ors:shape:{line_id}:out")
-
-    used_ors = (in_src == "ors" or out_src == "ors")
 
     # Fallback to straight stop path if ORS failed
     if not in_shape and inbound_pts:
@@ -248,6 +275,7 @@ async def line_shape(line_id: str):
         "outbound": [out_shape] if out_shape else [],
         "meta": {"in_source": in_src, "out_source": out_src}
     }
+
 
 
 # =========================

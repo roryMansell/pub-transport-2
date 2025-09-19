@@ -38,300 +38,288 @@
     <div id="map" class="map"></div>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    // Backend API
-    const API = "https://pub-transport-2.onrender.com";
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // Backend API
+  const API = "https://pub-transport-2.onrender.com";
 
-    const routesEl = document.getElementById('routes');
-    const searchEl = document.getElementById('search');
-    const clearBtn = document.getElementById('clear');
-    const statusEl = document.getElementById('status');
-    let allRoutes = [];
-    let selected = new Set();
-    let pollTimer = null;
+  const routesEl = document.getElementById('routes');
+  const searchEl = document.getElementById('search');
+  const clearBtn = document.getElementById('clear');
+  const statusEl = document.getElementById('status');
+  let allRoutes = [];
+  let selected = new Set();
+  let pollTimer = null;
 
-    // Per-route state: lineId -> { group, poly_in, poly_out, stops, vehiclesState(Map), color }
-    const lineLayers = new Map();
+  // Per-route state: lineId -> { group, vehiclesState(Map), color }
+  const lineLayers = new Map();
 
-    // Map
-    const map = L.map('map').setView([51.5074, -0.1278], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap',
-      maxZoom: 19
-    }).addTo(map);
+  // Map
+  const map = L.map('map').setView([51.5074, -0.1278], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap',
+    maxZoom: 19
+  }).addTo(map);
 
-    // Helpers
-    const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
-    const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
-    const lerp = (a,b,t)=>a+(b-a)*t, clamp01=(x)=>Math.max(0,Math.min(1,x));
+  // Helpers
+  const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
+  const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
+  const lerp = (a,b,t)=>a+(b-a)*t, clamp01=(x)=>Math.max(0,Math.min(1,x));
 
-    function bearingDeg(lat1, lon1, lat2, lon2) {
-      const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
-      const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
-      const y = Math.sin(Δλ) * Math.cos(φ2);
-      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-      let brng = toDeg(Math.atan2(y, x));
-      return (brng + 360) % 360;
-    }
+  function bearingDeg(lat1, lon1, lat2, lon2) {
+    const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
+    const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+    let brng = toDeg(Math.atan2(y, x));
+    return (brng + 360) % 360;
+  }
 
-    function busIcon(color, rotationDeg) {
-      const html =
-        `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
-           <div style="
-             width:0; height:0;
-             border-left:9px solid transparent;
-             border-right:9px solid transparent;
-             border-bottom:18px solid ${color};
-             filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
-           "></div>
-         </div>`;
-      return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
-    }
+  function busIcon(color, rotationDeg) {
+    const html =
+      `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
+         <div style="
+           width:0; height:0;
+           border-left:9px solid transparent;
+           border-right:9px solid transparent;
+           border-bottom:18px solid ${color};
+           filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
+         "></div>
+       </div>`;
+    return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
+  }
 
-    async function fetchJSON(url) {
-      const r = await fetch(url, { mode: "cors" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
-      return r.json();
-    }
+  async function fetchJSON(url) {
+    const r = await fetch(url, { mode: "cors" });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
+    return r.json();
+  }
 
-    function renderRoutes() {
-      const q = (searchEl.value || "").trim().toLowerCase();
-      const filtered = q ? allRoutes.filter(r =>
-        r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q)
-      ) : allRoutes;
+  function renderRoutes() {
+    const q = (searchEl.value || "").trim().toLowerCase();
+    const filtered = q ? allRoutes.filter(r =>
+      r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q)
+    ) : allRoutes;
 
-      routesEl.innerHTML = "";
-      filtered.slice(0, 300).forEach(r => {
-        const label = document.createElement('label');
-        label.className = 'route-item';
+    routesEl.innerHTML = "";
+    filtered.slice(0, 300).forEach(r => {
+      const label = document.createElement('label');
+      label.className = 'route-item';
 
-        const swatch = document.createElement('span');
-        Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
+      const swatch = document.createElement('span');
+      Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
 
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = selected.has(r.id);
-        cb.addEventListener('change', () => {
-          if (cb.checked) { selected.add(r.id); ensureRouteLoaded(r.id); }
-          else { selected.delete(r.id); removeRouteLayers(r.id); }
-          schedulePolling();
-        });
-
-        const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
-        const nameSpan = document.createElement('span'); nameSpan.textContent = r.name || r.id;
-
-        label.appendChild(cb); label.appendChild(swatch); label.appendChild(idSpan); label.appendChild(nameSpan);
-        routesEl.appendChild(label);
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = selected.has(r.id);
+      cb.addEventListener('change', () => {
+        if (cb.checked) { selected.add(r.id); ensureRouteLoaded(r.id); }
+        else { selected.delete(r.id); removeRouteLayers(r.id); }
+        schedulePolling();
       });
 
-      if (filtered.length > 300) {
-        const note = document.createElement('div'); note.className = 'muted'; note.textContent = 'Showing first 300. Refine your search.'; routesEl.appendChild(note);
-      }
-    }
+      const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
+      const nameSpan = document.createElement('span'); nameSpan.textContent = r.name || r.id;
 
-    function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
-
-    function schedulePolling() {
-      // stop any existing poller
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-
-      // remove any route layers that are no longer selected
-      for (const lineId of Array.from(lineLayers.keys())) {
-        if (!selected.has(lineId)) removeRouteLayers(lineId);
-      }
-
-      // if nothing selected, nuke everything & update status
-      if (selected.size === 0) {
-        // double-ensure cleanup (in case something slipped through)
-        for (const lineId of Array.from(lineLayers.keys())) {
-          removeRouteLayers(lineId);
-        }
-        setStatus("No routes selected. Tick some on the left.", "muted");
-        return;
-      }
-
-      setStatus("Live updating…", "muted");
-
-      // take a snapshot of the current selection for this tick
-      const load = async () => {
-        const lines = Array.from(selected);
-        try {
-          await updateVehicles(lines);
-        } catch (e) {
-          setStatus("Error: " + e.message, "error");
-        }
-      };
-
-      // run immediately, then every 5s
-      load();
-      pollTimer = setInterval(load, 5000);
-    }
-
-
-    function removeRouteLayers(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      map.removeLayer(layers.group);   // removes polylines, stops, and vehicle markers
-      lineLayers.delete(lineId);
-    }
-
-    async function ensureRouteLoaded(lineId) {
-      if (lineLayers.has(lineId)) return;
-      const color = colorFor(lineId);
-
-      const group = L.layerGroup().addTo(map);
-      const vehiclesState = new Map(); // key -> { marker, meta }
-
-      // 1) Road-following geometry (robust to empty/missing)
-      let shape = { inbound: [], outbound: [] };
-      try {
-        shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
-      } catch (e) {
-        console.warn("shape fetch failed for", lineId, e);
-      }
-
-      const drawMulti = (multi, opts) => {
-        const g = L.layerGroup();
-        (multi || []).forEach(seg => {
-          if (Array.isArray(seg) && seg.length >= 2) L.polyline(seg, opts).addTo(g);
-        });
-        if (g.getLayers().length) g.addTo(group);
-        return g;
-      };
-
-      const poly_in  = drawMulti(shape.inbound,  { color, weight: 4, opacity: 0.85 });
-      const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
-
-      // 2) Stops (still draw even if shapes were empty)
-      const seq = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
-      const stopsLayer = L.layerGroup().addTo(group);
-      const addStops = (arr) => {
-        (arr || []).forEach(sp => {
-          if (sp.lat == null || sp.lon == null) return;
-          L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
-          L.circleMarker([sp.lat, sp.lon], { radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-            .bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
-        });
-      };
-      addStops(seq.inbound); addStops(seq.outbound);
-
-      lineLayers.set(lineId, { group, poly_in, poly_out, stops: stopsLayer, vehiclesState, color });
-
-      // Fit bounds if we drew any shape
-      let bounds = null;
-      const collectBounds = (grp) => grp && grp.eachLayer && grp.eachLayer(l => { if (l.getBounds) bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds(); });
-      collectBounds(poly_in); collectBounds(poly_out);
-      if (bounds) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
-    }
-
-    async function updateVehicles(lines) {
-      try {
-        await Promise.all(lines.map(ensureRouteLoaded));
-        await Promise.all(lines.map(loadLine));
-      } catch (e) {
-        setStatus("Error: " + e.message, "error");
-      }
-    }
-
-    // Load vehicles for one line, update/animate arrows
-    async function loadLine(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      const { vehiclesState, color } = layers;
-
-      const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const vehicles = data.vehicles || [];
-      const seen = new Set();
-
-      for (const v of vehicles) {
-        const key = `${lineId}::${v.vehicle_id}`;
-        seen.add(key);
-
-        const hasPrev = (v.prev_lat != null && v.prev_lon != null);
-        const hasNext = (v.next_lat != null && v.next_lon != null);
-        if (!hasPrev && !hasNext) continue;
-
-        const pPrev = hasPrev ? [v.prev_lat, v.prev_lon] : [v.next_lat, v.next_lon];
-        const pNext = hasNext ? [v.next_lat, v.next_lon] : [v.prev_lat, v.prev_lon];
-        const rot = bearingDeg(pPrev[0], pPrev[1], pNext[0], pNext[1]);
-
-        let st = vehiclesState.get(key);
-        if (!st) {
-          const m = L.marker(pPrev, { icon: busIcon(color, rot) }).addTo(layers.group);
-          m.bindPopup(
-            `<b>Route:</b> ${v.route}<br>` +
-            `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-            `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
-            `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-          );
-          st = { marker: m, meta: {}, color };
-          vehiclesState.set(key, st);
-        } else {
-          st.marker.setIcon(busIcon(color, rot));
-          st.marker.getPopup()?.setContent(
-            `<b>Route:</b> ${v.route}<br>` +
-            `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-            `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
-            `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-          );
-        }
-
-        st.meta = {
-          prev: pPrev,
-          next: pNext,
-          startEta: Math.max(v.eta_seconds, 1),
-          syncedAtMs: Date.now()
-        };
-      }
-
-      // remove stale vehicles for this line
-      for (const key of Array.from(vehiclesState.keys())) {
-        if (!seen.has(key)) {
-          vehiclesState.get(key).marker.remove();
-          vehiclesState.delete(key);
-        }
-      }
-    }
-
-    // Animation loop — move arrows from prev -> next between polls
-    setInterval(() => {
-      for (const { vehiclesState } of lineLayers.values()) {
-        const now = Date.now();
-        for (const st of vehiclesState.values()) {
-          const { marker, meta } = st;
-          if (!meta || !meta.prev || !meta.next) continue;
-          const p = clamp01((now - meta.syncedAtMs) / 1000 / meta.startEta);
-          const lat = lerp(meta.prev[0], meta.next[0], p);
-          const lon = lerp(meta.prev[1], meta.next[1], p);
-          marker.setLatLng([lat, lon]);
-        }
-      }
-    }, 100); // ~10fps
-
-    // UI wiring
-    searchEl.addEventListener('input', renderRoutes);
-    clearBtn.addEventListener('click', () => {
-      selected = new Set();
-      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
-      schedulePolling();
-      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+      label.appendChild(cb); label.appendChild(swatch); label.appendChild(idSpan); label.appendChild(nameSpan);
+      routesEl.appendChild(label);
     });
 
-    // Boot
-    (async () => {
-      try {
-        const data = await fetchJSON(`${API}/routes`);
-        allRoutes = data;
-        setStatus(`Loaded ${allRoutes.length} routes.`);
-        renderRoutes();
-      } catch (e) {
-        setStatus("Error loading routes: " + e.message, "error");
+    if (filtered.length > 300) {
+      const note = document.createElement('div'); note.className = 'muted'; note.textContent = 'Showing first 300. Refine your search.'; routesEl.appendChild(note);
+    }
+  }
+
+  function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
+
+  function schedulePolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+    // remove lines no longer selected
+    for (const lineId of Array.from(lineLayers.keys())) {
+      if (!selected.has(lineId)) removeRouteLayers(lineId);
+    }
+
+    if (selected.size === 0) {
+      map.eachLayer(l => { if (!(l instanceof L.TileLayer)) map.removeLayer(l); });
+      lineLayers.clear();
+      setStatus("No routes selected. Tick some on the left.", "muted");
+      return;
+    }
+
+    setStatus("Live updating…", "muted");
+    const load = async () => {
+      const lines = Array.from(selected);
+      try { await updateVehicles(lines); }
+      catch (e) { setStatus("Error: " + e.message, "error"); }
+    };
+    load();
+    pollTimer = setInterval(load, 5000);
+  }
+
+  function removeRouteLayers(lineId) {
+    const layers = lineLayers.get(lineId);
+    if (!layers) return;
+    try {
+      if (layers.group && layers.group.clearLayers) layers.group.clearLayers();
+      if (map.hasLayer(layers.group)) map.removeLayer(layers.group);
+    } finally {
+      if (layers.vehiclesState && layers.vehiclesState.clear) layers.vehiclesState.clear();
+      lineLayers.delete(lineId);
+    }
+  }
+
+  async function ensureRouteLoaded(lineId) {
+    if (lineLayers.has(lineId)) return;
+    const color = colorFor(lineId);
+
+    const group = L.featureGroup().addTo(map);
+    const vehiclesState = new Map();
+
+    // Try shape
+    let shape = { inbound: [], outbound: [] };
+    try { shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`); }
+    catch (e) { console.warn("shape fetch failed for", lineId, e); }
+
+    const drawMulti = (multi, opts) => {
+      const g = L.layerGroup();
+      (multi || []).forEach(seg => {
+        if (Array.isArray(seg) && seg.length >= 2) L.polyline(seg, opts).addTo(g);
+      });
+      if (g.getLayers().length) g.addTo(group);
+      return g;
+    };
+
+    const poly_in  = drawMulti(shape.inbound,  { color, weight: 4, opacity: 0.85 });
+    const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
+
+    // Stops
+    const stops = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
+    const stopsLayer = L.layerGroup().addTo(group);
+    const addStops = (arr) => {
+      (arr || []).forEach(sp => {
+        if (sp.lat == null || sp.lon == null) return;
+        L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
+        L.circleMarker([sp.lat, sp.lon], { radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
+          .bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
+      });
+    };
+    addStops(stops.inbound); addStops(stops.outbound);
+
+    // Fallback if no shape
+    let drewAny = false;
+    if (poly_in && poly_in.getLayers && poly_in.getLayers().length) drewAny = true;
+    if (poly_out && poly_out.getLayers && poly_out.getLayers().length) drewAny = true;
+    if (!drewAny) {
+      const toLatLngs = (arr) => (arr || []).filter(s => s.lat != null && s.lon != null).map(s => [s.lat, s.lon]);
+      L.polyline(toLatLngs(stops.inbound),  { color, weight: 4, opacity: 0.65 }).addTo(group);
+      L.polyline(toLatLngs(stops.outbound), { color, weight: 4, opacity: 0.45, dashArray: "6,6" }).addTo(group);
+    }
+
+    lineLayers.set(lineId, { group, vehiclesState, color });
+
+    if (group.getLayers().length) {
+      const b = group.getBounds?.();
+      if (b && b.isValid()) map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
+    }
+  }
+
+  async function updateVehicles(lines) {
+    try {
+      await Promise.all(lines.map(ensureRouteLoaded));
+      await Promise.all(lines.map(loadLine));
+    } catch (e) { setStatus("Error: " + e.message, "error"); }
+  }
+
+  async function loadLine(lineId) {
+    const layers = lineLayers.get(lineId);
+    if (!layers) return;
+    const { vehiclesState, color } = layers;
+
+    const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
+    const vehicles = data.vehicles || [];
+    const seen = new Set();
+
+    for (const v of vehicles) {
+      const key = `${lineId}::${v.vehicle_id}`;
+      seen.add(key);
+
+      const hasPrev = (v.prev_lat != null && v.prev_lon != null);
+      const hasNext = (v.next_lat != null && v.next_lon != null);
+      if (!hasPrev && !hasNext) continue;
+
+      const pPrev = hasPrev ? [v.prev_lat, v.prev_lon] : [v.next_lat, v.next_lon];
+      const pNext = hasNext ? [v.next_lat, v.next_lon] : [v.prev_lat, v.prev_lon];
+      const rot = bearingDeg(pPrev[0], pPrev[1], pNext[0], pNext[1]);
+
+      let st = vehiclesState.get(key);
+      if (!st) {
+        const m = L.marker(pPrev, { icon: busIcon(color, rot) }).addTo(layers.group);
+        m.bindPopup(
+          `<b>Route:</b> ${v.route}<br>` +
+          `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
+          `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
+          `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
+        );
+        st = { marker: m, meta: {}, color };
+        vehiclesState.set(key, st);
+      } else {
+        st.marker.setIcon(busIcon(color, rot));
+        st.marker.getPopup()?.setContent(
+          `<b>Route:</b> ${v.route}<br>` +
+          `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
+          `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
+          `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
+        );
       }
-    })();
-  </script>
+
+      st.meta = { prev: pPrev, next: pNext, startEta: Math.max(v.eta_seconds, 1), syncedAtMs: Date.now() };
+    }
+
+    for (const key of Array.from(vehiclesState.keys())) {
+      if (!seen.has(key)) {
+        vehiclesState.get(key).marker.remove();
+        vehiclesState.delete(key);
+      }
+    }
+  }
+
+  // Animate buses between stops
+  setInterval(() => {
+    for (const { vehiclesState } of lineLayers.values()) {
+      const now = Date.now();
+      for (const st of vehiclesState.values()) {
+        const { marker, meta } = st;
+        if (!meta || !meta.prev || !meta.next) continue;
+        const p = clamp01((now - meta.syncedAtMs) / 1000 / meta.startEta);
+        const lat = lerp(meta.prev[0], meta.next[0], p);
+        const lon = lerp(meta.prev[1], meta.next[1], p);
+        marker.setLatLng([lat, lon]);
+      }
+    }
+  }, 100);
+
+  // UI wiring
+  searchEl.addEventListener('input', renderRoutes);
+  clearBtn.addEventListener('click', () => {
+    selected = new Set();
+    for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
+    schedulePolling();
+    for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+  });
+
+  // Boot
+  (async () => {
+    try {
+      const data = await fetchJSON(`${API}/routes`);
+      allRoutes = data;
+      setStatus(`Loaded ${allRoutes.length} routes.`);
+      renderRoutes();
+    } catch (e) {
+      setStatus("Error loading routes: " + e.message, "error");
+    }
+  })();
+</script>
+
 </body>
 </html>

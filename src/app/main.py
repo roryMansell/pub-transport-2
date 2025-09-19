@@ -137,151 +137,108 @@ async def debug_tfl():
 # =========================
 @app.get("/line/{line_id}/stops")
 async def line_stops(line_id: str):
-    """Ordered stops for inbound/outbound."""
-    try:
+    """Ordered stops for inbound/outbound, cached ~10 minutes."""
+
+    def build_raw():
         with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
             r_in = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); r_in.raise_for_status()
             r_out = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); r_out.raise_for_status()
-            inbound = r_in.json(); outbound = r_out.json()
+            return r_in.json(), r_out.json()
 
-        def simplify(seq_json):
-            out = []
-            for s in (seq_json or {}).get("stopPointSequences", []):
-                for sp in s.get("stopPoint", []):
-                    out.append({
-                        "id": sp["id"],
-                        "name": sp.get("name"),
-                        "lat": sp.get("lat"),
-                        "lon": sp.get("lon"),
-                    })
-            return out
+    inbound_json, outbound_json = memo(f"rawstops:{line_id}", 600, build_raw)
 
-        return {"line_id": line_id, "inbound": simplify(inbound), "outbound": simplify(outbound)}
+    def simplify(seq_json):
+        out = []
+        for s in seq_json.get("stopPointSequences", []):
+            for sp in s.get("stopPoint", []):
+                out.append({
+                    "id": sp["id"],
+                    "name": sp.get("name"),
+                    "lat": sp.get("lat"),
+                    "lon": sp.get("lon"),
+                })
+        return out
 
-    except httpx.HTTPStatusError as e:
-        txt = (e.response.text or "")[:400]
-        raise HTTPException(status_code=502, detail=f"TfL HTTP {e.response.status_code}: {txt}")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"TfL request failed: {e}")
+    return {
+        "line_id": line_id,
+        "inbound": simplify(inbound_json),
+        "outbound": simplify(outbound_json),
+    }
+
 
 # =========================
 # Road-following geometry (lineStrings)
 # =========================
+
+ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
+ORS_TOKEN = os.getenv("ORS_TOKEN")
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
-    Return road-following 'lineStrings' for inbound/outbound as [[lat, lon], ...] lists.
-    TfL places geometry in several different spots and coordinate orders; we check them all.
+    Road-following shape for a bus line using ORS Directions.
+    Cached for 24h to save quota.
     """
 
-    def fetch_all():
-        with httpx.Client(timeout=25.0, headers=HTTP_HEADERS) as c:
-            # Route/Sequence (dir-specific)
-            rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
-            rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
-            inbound_seq, outbound_seq = rin.json(), rout.json()
+    # 1) Fetch stop sequences from TfL
+    async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as client:
+        r_in = await client.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params())
+        r_out = await client.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params())
+        r_in.raise_for_status()
+        r_out.raise_for_status()
+        inbound_json, outbound_json = r_in.json(), r_out.json()
 
-            # Generic Route endpoint (sometimes only here)
-            r = c.get(f"{TFL_BASE}/Line/{line_id}/Route", params=tfl_params()); r.raise_for_status()
-            route_root = r.json()
-        return inbound_seq, outbound_seq, route_root
-
-    inbound_seq, outbound_seq, route_root = memo(f"rawshape:{line_id}", 300, fetch_all)
-
-    def norm_pair(a: float, b: float) -> List[float]:
-        # If looks like [lon,lat] (London lon ~ -1.5..0.5, lat ~ 50..52.5), swap.
-        if -1.5 <= a <= 0.5 and 50.0 <= b <= 52.5:
-            return [b, a]
-        return [a, b]
-
-    def parse_string_ls(s: str) -> Optional[List[List[float]]]:
-        # Accept forms like "51.5,-0.12 51.51,-0.13" or "[-0.12,51.5] [-0.13,51.51]"
-        pts: List[List[float]] = []
-        s = s.replace("[", "").replace("]", "").strip()
-        if not s:
-            return None
-        for token in s.split():
-            parts = token.split(",")
-            if len(parts) != 2:
-                continue
-            try:
-                a = float(parts[0]); b = float(parts[1])
-            except ValueError:
-                continue
-            pts.append(norm_pair(a, b))
-        return pts if len(pts) >= 2 else None
-
-    def parse_list_ls(raw_list: List[Any]) -> Optional[List[List[float]]]:
-        # raw_list: [[a,b],[a,b],...] but order might be [lon,lat]
-        pts: List[List[float]] = []
-        for p in raw_list:
-            if not (isinstance(p, (list, tuple)) and len(p) == 2):
-                return None
-            try:
-                a = float(p[0]); b = float(p[1])
-            except (TypeError, ValueError):
-                return None
-            pts.append(norm_pair(a, b))
-        return pts if len(pts) >= 2 else None
-
-    def collect_from(obj: Dict[str, Any]) -> List[List[List[float]]]:
-        out: List[List[List[float]]] = []
-        # 1) top-level lineStrings
-        for raw in (obj.get("lineStrings") or []):
-            pts = parse_string_ls(raw) if isinstance(raw, str) else parse_list_ls(raw) if isinstance(raw, list) else None
-            if pts: out.append(pts)
-        # 2) stopPointSequences[*].lineStrings
-        for s in (obj.get("stopPointSequences") or []):
-            for raw in (s.get("lineStrings") or []):
-                pts = parse_string_ls(raw) if isinstance(raw, str) else parse_list_ls(raw) if isinstance(raw, list) else None
-                if pts: out.append(pts)
-        # 3) orderedLineRoutes[*].lineStrings
-        for r in (obj.get("orderedLineRoutes") or []):
-            for raw in (r.get("lineStrings") or []):
-                pts = parse_string_ls(raw) if isinstance(raw, str) else parse_list_ls(raw) if isinstance(raw, list) else None
-                if pts: out.append(pts)
+    def simplify(seq_json):
+        out = []
+        for s in (seq_json or {}).get("stopPointSequences", []):
+            for sp in s.get("stopPoint", []):
+                if sp.get("lat") is not None and sp.get("lon") is not None:
+                    out.append((float(sp["lat"]), float(sp["lon"])))
         return out
 
-    inbound_lines = collect_from(inbound_seq)
-    outbound_lines = collect_from(outbound_seq)
+    inbound_pts = simplify(inbound_json)
+    outbound_pts = simplify(outbound_json)
 
-    # 4) Fallback: /Line/{id}/Route → routeSections[].lineStrings
-    # This endpoint isn't split by direction, so we just stuff any geometry we find into both if empty.
-    def collect_from_route_root(root: Any) -> List[List[List[float]]]:
-        out: List[List[List[float]]] = []
-        for sec in (root.get("routeSections") or []):
-            for raw in (sec.get("lineStrings") or []):
-                pts = parse_string_ls(raw) if isinstance(raw, str) else parse_list_ls(raw) if isinstance(raw, list) else None
-                if pts: out.append(pts)
-        return out
+    async def ors_route(points, cache_key):
+        if len(points) < 2 or not ORS_TOKEN:
+            return []
 
-    if not inbound_lines or not outbound_lines:
-        # /Line/{id}/Route can be an array or an object depending on API; handle both
-        route_objs = route_root if isinstance(route_root, list) else [route_root]
-        extra: List[List[List[float]]] = []
-        for obj in route_objs:
-            if isinstance(obj, dict):
-                extra.extend(collect_from_route_root(obj))
-        if not inbound_lines:
-            inbound_lines = extra[:]
-        if not outbound_lines:
-            outbound_lines = extra[:]
+        def build():
+            # ORS takes [lon,lat] coords
+            coords = [[lon, lat] for lat, lon in points]
 
-    # Deduplicate near-duplicates (length + endpoints)
-    def dedupe(lines: List[List[List[float]]]) -> List[List[List[float]]]:
-        seen = set(); result = []
-        for pts in lines:
-            key = (len(pts),
-                   round(pts[0][0], 5), round(pts[0][1], 5),
-                   round(pts[-1][0], 5), round(pts[-1][1], 5))
-            if key in seen: continue
-            seen.add(key); result.append(pts)
-        return result
+            # If more than 50 points, thin the list
+            if len(coords) > 50:
+                step = max(1, len(coords) // 49)
+                coords = coords[::step] + [coords[-1]]
+
+            body = {"coordinates": coords, "format": "geojson"}
+            headers = {"Authorization": ORS_TOKEN}
+            with httpx.Client(timeout=30.0) as client:
+                r = client.post(ORS_BASE, json=body, headers=headers)
+                if r.status_code == 429:  # quota exceeded
+                    return []
+                r.raise_for_status()
+                data = r.json()
+
+            coords_out = data["features"][0]["geometry"]["coordinates"]
+            return [[lat, lon] for lon, lat in coords_out]
+
+        # cache result for 24h
+        return memo(cache_key, 86400, build)
+
+    inbound_shape = await ors_route(inbound_pts, f"ors:shape:{line_id}:in")
+    outbound_shape = await ors_route(outbound_pts, f"ors:shape:{line_id}:out")
+
+    # Fallback: straight lines if ORS failed
+    if not inbound_shape and inbound_pts:
+        inbound_shape = inbound_pts
+    if not outbound_shape and outbound_pts:
+        outbound_shape = outbound_pts
 
     return {
         "line_id": line_id,
-        "inbound": dedupe(inbound_lines),
-        "outbound": dedupe(outbound_lines),
+        "inbound": [inbound_shape] if inbound_shape else [],
+        "outbound": [outbound_shape] if outbound_shape else [],
     }
 
 # =========================

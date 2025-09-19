@@ -219,9 +219,17 @@
     lineLayers.set(lineId, { group, vehiclesState, color });
 
     if (group.getLayers().length) {
-      const b = group.getBounds?.();
-      if (b && b.isValid()) map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
+      let bounds = null;
+      group.eachLayer(l => {
+        if (l instanceof L.Polyline && l.getBounds) {
+          bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
+        }
+      });
+      if (bounds && bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
+      }
     }
+
   }
 
   async function updateVehicles(lines) {

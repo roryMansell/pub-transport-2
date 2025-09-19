@@ -144,48 +144,89 @@ async def line_stops(line_id: str):
 
     return {"line_id": line_id, "inbound": simplify(inbound), "outbound": simplify(outbound)}
 
+from datetime import datetime, timezone
+
+from datetime import datetime, timezone
+
 @app.get("/vehicles")
 async def vehicles(line_id: str = Query(..., description="TfL bus line id, e.g. 88")):
-    """Approximate vehicle positions by placing them at their next stop."""
+    """Approximate positions by interpolating from previous stop -> next stop using timeToStation."""
     async with httpx.AsyncClient(timeout=12.0, headers=HTTP_HEADERS) as client:
         r = await client.get(f"{TFL_BASE}/Line/{line_id}/Arrivals", params=tfl_params())
         r.raise_for_status()
         arr = r.json()
 
-        # Build or reuse stop map for this line (5 min)
-        def build_stop_map():
-            # NOTE: we are in a sync wrapper for memo(); build with already-fetched HTTP client via .run()
-            # but since memo expects sync, we perform blocking fetch with httpx (open new client).
-            with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
-                rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
-                rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
-                in_json = rin.json(); out_json = rout.json()
-            def to_map(seq_json):
-                m = {}
-                for s in seq_json.get("stopPointSequences", []):
-                    for sp in s.get("stopPoint", []):
-                        m[sp["id"]] = (sp.get("lat"), sp.get("lon"), sp.get("name"))
-                return m
-            m = to_map(in_json); m.update(to_map(out_json))
-            return m
+    # Cache the ordered stop sequences for 5 minutes
+    def build_sequences():
+        with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
+            rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
+            rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
+            in_json, out_json = rin.json(), rout.json()
 
-        stop_map = memo(f"stops:{line_id}", 300, build_stop_map)
+        def flatten(seq_json):
+            out = []
+            for s in seq_json.get("stopPointSequences", []):
+                for sp in s.get("stopPoint", []):
+                    out.append({"id": sp["id"], "name": sp.get("name"), "lat": sp.get("lat"), "lon": sp.get("lon")})
+            # de-dup preserving order
+            seen, ordered = set(), []
+            for sp in out:
+                if sp["id"] in seen: continue
+                seen.add(sp["id"]); ordered.append(sp)
+            return ordered
 
-    vehicles: List[Dict[str, Any]] = []
+        return {"inbound": flatten(in_json), "outbound": flatten(out_json)}
+
+    sequences = memo(f"seq:{line_id}", 300, build_sequences)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    def seq_for(direction: str):
+        d = (direction or "").lower()
+        if d.startswith("in"): return sequences["inbound"]
+        if d.startswith("out"): return sequences["outbound"]
+        return sequences["inbound"]
+
+    vehicles = []
     for it in arr:
-        stop_id = it.get("naptanId") or it.get("stationId") or it.get("id")
-        lat, lon, name = (None, None, None)
-        if stop_id and stop_id in stop_map:
-            lat, lon, name = stop_map[stop_id]
+        next_stop_id = it.get("naptanId") or it.get("stationId") or it.get("id")
+        direction = it.get("direction")
+        eta = max(int(it.get("timeToStation", 0)), 0)
+        route = it.get("lineName")
+        vehicle_id = it.get("vehicleId")
+
+        seq = seq_for(direction)
+        idx = None
+        for i, sp in enumerate(seq):
+            if sp["id"] == next_stop_id:
+                idx = i
+                break
+
+        prev_sp = seq[idx-1] if (idx is not None and idx > 0) else None
+        next_sp = seq[idx] if (idx is not None) else None
+
+        def val(sp, key):
+            return None if sp is None else sp.get(key)
+
         vehicles.append({
             "line_id": line_id,
-            "route": it.get("lineName"),
-            "vehicle_id": it.get("vehicleId"),
-            "eta_seconds": max(int(it.get("timeToStation", 0)), 0),
-            "next_stop_id": stop_id,
-            "next_stop_name": name,
-            "lat": lat, "lon": lon,
-            "direction": it.get("direction"),
+            "route": route,
+            "vehicle_id": vehicle_id,
+            "direction": direction,
+            "eta_seconds": eta,
+            "fetched_at": fetched_at,
+            "next_stop_id": next_stop_id,
+            "next_stop_name": val(next_sp, "name"),
+            # legacy fields (next stop coords)
+            "lat": val(next_sp, "lat"),
+            "lon": val(next_sp, "lon"),
+            # interpolation fields
+            "prev_stop_id": val(prev_sp, "id"),
+            "prev_stop_name": val(prev_sp, "name"),
+            "prev_lat": val(prev_sp, "lat"),
+            "prev_lon": val(prev_sp, "lon"),
+            "next_lat": val(next_sp, "lat"),
+            "next_lon": val(next_sp, "lon"),
         })
+
     vehicles.sort(key=lambda v: v["eta_seconds"])
-    return {"line_id": line_id, "vehicles": vehicles}
+    return {"line_id": line_id, "fetched_at": fetched_at, "vehicles": vehicles}

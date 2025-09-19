@@ -344,30 +344,38 @@ async def vehicles(line_id: str = Query(..., description="TfL bus line id, e.g. 
 
 @app.get("/debug/ors")
 def debug_ors():
-    """Quick check that ORS token works from the server."""
-    import os, httpx
-    ORS_TOKEN = os.getenv("ORS_TOKEN")
-    if not ORS_TOKEN:
+    """Check ORS token + show the exact response."""
+    import os, httpx, json
+    token = os.getenv("ORS_TOKEN")
+    if not token:
         return {"ok": False, "reason": "ORS_TOKEN not set in environment"}
 
     body = {
-        "coordinates": [[-0.1278, 51.5074], [-0.1, 51.51]],  # Westminster -> City-ish
+        "coordinates": [[-0.1278, 51.5074], [-0.1, 51.51]],  # [lon,lat]
         "format": "geojson"
     }
     try:
         r = httpx.post(
             "https://api.openrouteservice.org/v2/directions/driving-car",
             json=body,
-            headers={"Authorization": ORS_TOKEN},
+            headers={"Authorization": token, "Content-Type": "application/json"},
             timeout=20.0,
         )
-        if r.status_code == 429:
-            return {"ok": False, "reason": "ORS quota exceeded (429)"}
-        r.raise_for_status()
-        feat = r.json()["features"][0]
-        n = len(feat["geometry"]["coordinates"])
-        return {"ok": True, "points": n}
-    except httpx.HTTPStatusError as e:
-        return {"ok": False, "reason": f"HTTP {e.response.status_code}", "body": (e.response.text or "")[:200]}
+        out = {
+            "ok": r.status_code == 200,
+            "status": r.status_code,
+            "headers": dict(r.headers),
+        }
+        # Try to parse JSON; otherwise return text snippet
+        try:
+            j = r.json()
+            out["json_keys"] = list(j.keys())
+            # If success, count points
+            if r.status_code == 200 and "features" in j and j["features"]:
+                pts = len(j["features"][0]["geometry"]["coordinates"])
+                out["points_in_route"] = pts
+        except Exception:
+            out["body_snippet"] = r.text[:500]
+        return out
     except Exception as e:
         return {"ok": False, "reason": str(e)}

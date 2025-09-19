@@ -1,0 +1,188 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bus RT Minimal</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
+    .app { display:flex; height:100%; }
+    .sidebar { width:320px; border-right:1px solid #ddd; padding:12px; overflow:auto; }
+    .map { flex:1; }
+    .row { display:flex; gap:6px; margin-bottom:8px; }
+    .muted { color:#666; font-size:12px; margin-bottom:8px; }
+    .route-item { display:flex; align-items:center; gap:6px; padding:2px 0; }
+    .route-id { font-family: ui-monospace, Menlo, Consolas, monospace; width:56px; }
+    .loading { font-size:12px; color:#888; }
+    .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <h3>London bus routes</h3>
+      <div class="row">
+        <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
+        <button id="clear">Clear</button>
+      </div>
+      <div class="muted">
+        Tick routes to load vehicles. Map updates every 5s.
+      </div>
+      <div id="status" class="loading">Loading routes…</div>
+      <div id="routes"></div>
+    </div>
+    <div id="map" class="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // >>> SET THIS TO YOUR RENDER URL (HTTPS) <<<
+    // e.g. const API = "https://bus-rt-api.onrender.com";
+    const API = "https://YOUR-RENDER-URL";
+
+    const routesEl = document.getElementById('routes');
+    const searchEl = document.getElementById('search');
+    const clearBtn = document.getElementById('clear');
+    const statusEl = document.getElementById('status');
+    let allRoutes = [];
+    let selected = new Set();
+    let pollTimer = null;
+    const markers = new Map(); // key: `${line_id}-${vehicle_id}`
+
+    // Map
+    const map = L.map('map').setView([51.5074, -0.1278], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap',
+      maxZoom: 19
+    }).addTo(map);
+
+    async function fetchJSON(url) {
+      const r = await fetch(url, { mode: "cors" });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
+      return r.json();
+    }
+
+    function renderRoutes() {
+      const q = (searchEl.value || "").trim().toLowerCase();
+      const filtered = q
+        ? allRoutes.filter(r => r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q))
+        : allRoutes;
+
+      routesEl.innerHTML = "";
+      filtered.slice(0, 300).forEach(r => {
+        const label = document.createElement('label');
+        label.className = 'route-item';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = selected.has(r.id);
+        cb.addEventListener('change', () => {
+          if (cb.checked) selected.add(r.id); else selected.delete(r.id);
+          schedulePolling();
+        });
+
+        const idSpan = document.createElement('span');
+        idSpan.className = 'route-id';
+        idSpan.textContent = r.id;
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = r.name || r.id;
+
+        label.appendChild(cb);
+        label.appendChild(idSpan);
+        label.appendChild(nameSpan);
+        routesEl.appendChild(label);
+      });
+
+      if (filtered.length > 300) {
+        const note = document.createElement('div');
+        note.className = 'muted';
+        note.textContent = 'Showing first 300. Refine your search.';
+        routesEl.appendChild(note);
+      }
+    }
+
+    function setStatus(msg, css = "loading") {
+      statusEl.className = css;
+      statusEl.textContent = msg;
+    }
+
+    function schedulePolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      // Clear markers for unselected lines
+      for (const key of Array.from(markers.keys())) {
+        const [line] = key.split("::");
+        if (!selected.has(line)) {
+          const m = markers.get(key);
+          m.remove(); markers.delete(key);
+        }
+      }
+      if (selected.size === 0) {
+        setStatus("No routes selected. Tick some on the left.", "muted");
+        return;
+      }
+      setStatus("Live updating…", "muted");
+      const load = () => updateVehicles(Array.from(selected));
+      load();
+      pollTimer = setInterval(load, 5000);
+    }
+
+    async function updateVehicles(lines) {
+      try {
+        await Promise.all(lines.map(loadLine));
+      } catch (e) {
+        setStatus("Error: " + e.message, "error");
+      }
+    }
+
+    async function loadLine(lineId) {
+      const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
+      const vehicles = data.vehicles || [];
+      const seen = new Set();
+
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return; // skip unknown coords
+        const key = `${lineId}::${v.vehicle_id}`;
+        seen.add(key);
+        if (markers.has(key)) {
+          markers.get(key).setLatLng([v.lat, v.lon]);
+        } else {
+          const m = L.marker([v.lat, v.lon]).addTo(map);
+          m.bindPopup(`<b>Route:</b> ${v.route}<br><b>Vehicle:</b> ${v.vehicle_id}<br><b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`);
+          markers.set(key, m);
+        }
+      });
+
+      // remove stale vehicles for this line
+      for (const key of Array.from(markers.keys())) {
+        if (key.startsWith(lineId + "::") && !seen.has(key)) {
+          markers.get(key).remove();
+          markers.delete(key);
+        }
+      }
+    }
+
+    // Event wiring
+    searchEl.addEventListener('input', renderRoutes);
+    clearBtn.addEventListener('click', () => {
+      selected = new Set();
+      schedulePolling();
+      // uncheck all checkboxes
+      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+    });
+
+    // Boot
+    (async () => {
+      try {
+        const data = await fetchJSON(`${API}/routes`);
+        allRoutes = data;
+        setStatus(`Loaded ${allRoutes.length} routes.`);
+        renderRoutes();
+      } catch (e) {
+        setStatus("Error loading routes: " + e.message, "error");
+      }
+    })();
+  </script>
+</body>
+</html>

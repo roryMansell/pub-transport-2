@@ -176,24 +176,30 @@
     const group = L.featureGroup().addTo(map);
     const vehiclesState = new Map();
 
-    // Try shape
+    // 1) Load shape (ORS)
     let shape = { inbound: [], outbound: [] };
-    try { shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`); }
-    catch (e) { console.warn("shape fetch failed for", lineId, e); }
+    try {
+      shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`);
+    } catch (e) {
+      console.warn("shape fetch failed", lineId, e);
+    }
 
-    const drawMulti = (multi, opts) => {
-      const g = L.layerGroup();
-      (multi || []).forEach(seg => {
-        if (Array.isArray(seg) && seg.length >= 2) L.polyline(seg, opts).addTo(g);
+    // draw helper: add each segment directly to the route group
+    const addedPolylines = [];
+    const addSegments = (segments, opts) => {
+      (segments || []).forEach(seg => {
+        if (Array.isArray(seg) && seg.length >= 2) {
+          const pl = L.polyline(seg, opts).addTo(group);
+          addedPolylines.push(pl);
+        }
       });
-      if (g.getLayers().length) g.addTo(group);
-      return g;
     };
 
-    const poly_in  = drawMulti(shape.inbound,  { color, weight: 4, opacity: 0.85 });
-    const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
+    // 2) Draw inbound (solid) + outbound (dashed)
+    addSegments(shape.inbound,  { color, weight: 4, opacity: 0.85 });
+    addSegments(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
 
-    // Stops
+    // 3) Stops (always)
     const stops = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
     const stopsLayer = L.layerGroup().addTo(group);
     const addStops = (arr) => {
@@ -206,31 +212,27 @@
     };
     addStops(stops.inbound); addStops(stops.outbound);
 
-    // Fallback if no shape
-    let drewAny = false;
-    if (poly_in && poly_in.getLayers && poly_in.getLayers().length) drewAny = true;
-    if (poly_out && poly_out.getLayers && poly_out.getLayers().length) drewAny = true;
-    if (!drewAny) {
+    // 4) Fallback line if ORS gave nothing
+    if (addedPolylines.length === 0) {
       const toLatLngs = (arr) => (arr || []).filter(s => s.lat != null && s.lon != null).map(s => [s.lat, s.lon]);
-      L.polyline(toLatLngs(stops.inbound),  { color, weight: 4, opacity: 0.65 }).addTo(group);
-      L.polyline(toLatLngs(stops.outbound), { color, weight: 4, opacity: 0.45, dashArray: "6,6" }).addTo(group);
+      addedPolylines.push(L.polyline(toLatLngs(stops.inbound),  { color, weight: 4, opacity: 0.65 }).addTo(group));
+      addedPolylines.push(L.polyline(toLatLngs(stops.outbound), { color, weight: 4, opacity: 0.45, dashArray: "6,6" }).addTo(group));
     }
 
+    // 5) Save state for cleanup/vehicles
     lineLayers.set(lineId, { group, vehiclesState, color });
 
-    if (group.getLayers().length) {
-      let bounds = null;
-      group.eachLayer(l => {
-        if (l instanceof L.Polyline && l.getBounds) {
-          bounds = bounds ? bounds.extend(l.getBounds()) : l.getBounds();
-        }
-      });
-      if (bounds && bounds.isValid()) {
-        map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
-      }
+    // 6) Fit to polyline bounds ONLY (avoids getLatLng on circleMarkers)
+    let bounds = null;
+    addedPolylines.forEach(pl => {
+      const b = pl.getBounds?.();
+      if (b) bounds = bounds ? bounds.extend(b) : b;
+    });
+    if (bounds && bounds.isValid()) {
+      map.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
     }
-
   }
+
 
   async function updateVehicles(lines) {
     try {

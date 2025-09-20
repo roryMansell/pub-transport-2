@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (smooth + polyline heading)</title>
+  <title>Bus RT Minimal</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -12,12 +12,11 @@
     .map { flex:1; }
     .row { display:flex; gap:6px; margin-bottom:8px; }
     .muted { color:#666; font-size:12px; margin-bottom:8px; }
-    .route-item { display:flex; align-items:center; gap:8px; padding:3px 0; }
+    .route-item { display:flex; align-items:center; gap:6px; padding:2px 0; }
     .route-id { font-family: ui-monospace, Menlo, Consolas, monospace; width:56px; }
     .loading { font-size:12px; color:#888; }
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
     .leaflet-pane .vehicle-arrow { z-index: 500; }
-    button { cursor:pointer; }
   </style>
 </head>
 <body>
@@ -28,10 +27,10 @@
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">Tick routes to load vehicles. Polls every 5s; animation is continuous.</div>
+      <div class="muted">Tick routes to load vehicles. Map updates every 5s.</div>
       <div class="muted" style="margin-bottom:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
-        Stops are white dots with a colored ring. Buses are colored arrows moving along the route.
+        Stops are white dots with a colored ring. Buses are colored arrows pointing to their next stop.
       </div>
       <div id="status" class="loading">Loading routes…</div>
       <div id="routes"></div>
@@ -39,457 +38,288 @@
     <div id="map" class="map"></div>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    // ==============================
-    // Config
-    // ==============================
-    const API = "https://pub-transport-2.onrender.com";
-    const AVG_SPEED_MPS = 7;         // ~25 km/h typical moving speed (tweak if you like)
-    const MIN_SLICE_SEC = 20;        // minimum plausible travel time between stops
-    const MAX_ETA_SEC = 1800;        // guardrail
-    const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // Backend API
+  const API = "https://pub-transport-2.onrender.com";
 
-    // ==============================
-    // DOM/state
-    // ==============================
-    const routesEl = document.getElementById('routes');
-    const searchEl = document.getElementById('search');
-    const clearBtn = document.getElementById('clear');
-    const statusEl = document.getElementById('status');
+  const routesEl = document.getElementById('routes');
+  const searchEl = document.getElementById('search');
+  const clearBtn = document.getElementById('clear');
+  const statusEl = document.getElementById('status');
+  let allRoutes = [];
+  let selected = new Set();
+  let pollTimer = null;
 
-    let allRoutes = [];
-    let selected = new Set();
-    let pollTimer = null;
+  // Per-route state: lineId -> { group, vehiclesState(Map), color }
+  const lineLayers = new Map();
 
-    // lineId -> {
-    //   group, vehicles(Map), color,
-    //   pathIn, cumIn, idxInByStop(Map),
-    //   pathOut, cumOut, idxOutByStop(Map)
-    // }
-    const lineLayers = new Map();
+  // Map
+  const map = L.map('map').setView([51.5074, -0.1278], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap',
+    maxZoom: 19
+  }).addTo(map);
 
-    // ==============================
-    // Map
-    // ==============================
-    const map = L.map('map').setView([51.5074, -0.1278], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap',
-      maxZoom: 19
-    }).addTo(map);
+  // Helpers
+  const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
+  const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
+  const lerp = (a,b,t)=>a+(b-a)*t, clamp01=(x)=>Math.max(0,Math.min(1,x));
 
-    // ==============================
-    // Helpers
-    // ==============================
-    const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
-    const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
-    const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
+  function bearingDeg(lat1, lon1, lat2, lon2) {
+    const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
+    const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+    let brng = toDeg(Math.atan2(y, x));
+    return (brng + 360) % 360;
+  }
 
-    function busIcon(color, rotationDeg) {
-      const html =
-        `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
-           <div style="
-             width:0; height:0;
-             border-left:9px solid transparent;
-             border-right:9px solid transparent;
-             border-bottom:18px solid ${color};
-             filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
-           "></div>
-         </div>`;
-      return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
-    }
+  function busIcon(color, rotationDeg) {
+    const html =
+      `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
+         <div style="
+           width:0; height:0;
+           border-left:9px solid transparent;
+           border-right:9px solid transparent;
+           border-bottom:18px solid ${color};
+           filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
+         "></div>
+       </div>`;
+    return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
+  }
 
-    function bearingDeg(lat1, lon1, lat2, lon2) {
-      const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
-      const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
-      const y = Math.sin(Δλ) * Math.cos(φ2);
-      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-      let brng = toDeg(Math.atan2(y, x));
-      return (brng + 360) % 360;
-    }
+  async function fetchJSON(url) {
+    const r = await fetch(url, { mode: "cors" });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
+    return r.json();
+  }
 
-    async function fetchJSON(url) {
-      const r = await fetch(url, { mode: "cors" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
-      return r.json();
-    }
+  function renderRoutes() {
+    const q = (searchEl.value || "").trim().toLowerCase();
+    const filtered = q ? allRoutes.filter(r =>
+      r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q)
+    ) : allRoutes;
 
-    function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
+    routesEl.innerHTML = "";
+    filtered.slice(0, 300).forEach(r => {
+      const label = document.createElement('label');
+      label.className = 'route-item';
 
-    // ==============================
-    // Polyline helpers
-    // ==============================
-    function haversineMeters(a, b) {
-      const R = 6371000;
-      const toRad = x => x * Math.PI / 180;
-      const dLat = toRad(b[0] - a[0]);
-      const dLon = toRad(b[1] - a[1]);
-      const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
-      const s = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
-      return 2 * R * Math.asin(Math.sqrt(s));
-    }
-    function cumulativeDistances(points) {
-      const cum = [0];
-      for (let i = 1; i < points.length; i++) cum[i] = cum[i-1] + haversineMeters(points[i-1], points[i]);
-      return cum;
-    }
-    function lowerBound(cum, lo, hi, target) {
-      lo = Math.max(0, lo); hi = Math.min(cum.length-1, hi);
-      while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
-      return lo;
-    }
-    function lerp(a,b,t){ return a + (b-a)*t; }
-    function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
+      const swatch = document.createElement('span');
+      Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
 
-    // return LatLng at absolute distance D along [i0..i1] (handles reversed order)
-    function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
-      const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
-      const startD = cum[i0], endD = cum[i1];
-      const tDist = Math.max(startD, Math.min(endD, targetD));
-      const j = lowerBound(cum, i0, i1, tDist);
-      if (j === i0) return points[i0];
-      const segLen = cum[j] - cum[j-1];
-      const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
-      return interpPoint(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
-    }
-
-    // === NEW: heading along the polyline tangent at posD ===
-    function headingOnSlice(meta, posD, stepMeters = 5) {
-      const { path, cum, iPrev, iNext } = meta;
-      const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
-      const a = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - stepMeters * dirSign);
-      const b = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + stepMeters * dirSign);
-      return bearingDeg(a[0], a[1], b[0], b[1]);
-    }
-
-    // ==============================
-    // UI
-    // ==============================
-    function renderRoutes() {
-      const q = (searchEl.value || "").trim().toLowerCase();
-      const filtered = q
-        ? allRoutes.filter(r => r.id.toLowerCase().includes(q) || (r.name||"").toLowerCase().includes(q))
-        : allRoutes;
-
-      routesEl.innerHTML = "";
-      filtered.slice(0, 300).forEach(r => {
-        const label = document.createElement('label');
-        label.className = 'route-item';
-
-        const swatch = document.createElement('span');
-        Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
-
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = selected.has(r.id);
-        cb.addEventListener('change', () => {
-          if (cb.checked) { selected.add(r.id); ensureRouteLoaded(r.id); }
-          else { selected.delete(r.id); removeRouteLayers(r.id); }
-          schedulePolling();
-        });
-
-        const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
-        const nameSpan = document.createElement('span'); nameSpan.textContent = r.name || r.id;
-
-        label.appendChild(cb); label.appendChild(swatch); label.appendChild(idSpan); label.appendChild(nameSpan);
-        routesEl.appendChild(label);
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = selected.has(r.id);
+      cb.addEventListener('change', () => {
+        if (cb.checked) { selected.add(r.id); ensureRouteLoaded(r.id); }
+        else { selected.delete(r.id); removeRouteLayers(r.id); }
+        schedulePolling();
       });
 
-      if (filtered.length > 300) {
-        const note = document.createElement('div'); note.className = 'muted'; note.textContent = 'Showing first 300. Refine your search.'; routesEl.appendChild(note);
-      }
-    }
+      const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
+      const nameSpan = document.createElement('span'); nameSpan.textContent = r.name || r.id;
 
-    function schedulePolling() {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-
-      for (const id of Array.from(lineLayers.keys())) {
-        if (!selected.has(id)) removeRouteLayers(id);
-      }
-
-      if (selected.size === 0) {
-        // remove all non-tile layers
-        map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { l.remove(); } catch { map.removeLayer(l); } } });
-        setStatus("No routes selected. Tick some on the left.", "muted");
-        return;
-      }
-
-      setStatus("Live updating…", "muted");
-
-      const load = async () => {
-        const lines = Array.from(selected);
-        try {
-          await updateVehicles(lines);
-        } catch (e) {
-          setStatus("Error: " + e.message, "error");
-        }
-      };
-
-      load();
-      pollTimer = setInterval(load, 5000);
-    }
-
-    function removeRouteLayers(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      try { layers.group.remove(); } catch { map.removeLayer(layers.group); }
-      lineLayers.delete(lineId);
-    }
-
-    // ==============================
-    // Load lines (shape + stops)
-    // ==============================
-    async function ensureRouteLoaded(lineId) {
-      if (lineLayers.has(lineId)) return;
-      const color = colorFor(lineId);
-
-      const group = L.featureGroup().addTo(map);
-      const vehicles = new Map(); // key -> { marker, meta }
-
-      const [shape, stops] = await Promise.all([
-        fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
-        fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`)
-      ]);
-
-      const pickPath = (segments) => {
-        let best = null;
-        for (const s of (segments || [])) if (Array.isArray(s) && s.length >= 2)
-          best = !best || s.length > best.length ? s : best;
-        return best || [];
-      };
-      const pathIn = pickPath(shape.inbound);
-      const pathOut = pickPath(shape.outbound);
-
-      const cumIn  = pathIn.length  ? cumulativeDistances(pathIn)  : [];
-      const cumOut = pathOut.length ? cumulativeDistances(pathOut) : [];
-
-      // map stop id -> nearest index on its direction path
-      const nearestIndex = (path, stop) => {
-        if (!path.length) return null;
-        let bestIdx = 0, bestD = Infinity;
-        for (let i = 0; i < path.length; i++) {
-          const d = haversineMeters(path[i], [stop.lat, stop.lon]);
-          if (d < bestD) { bestD = d; bestIdx = i; }
-        }
-        return bestIdx;
-      };
-      const idxInByStop = new Map();
-      const idxOutByStop = new Map();
-      (stops.inbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathIn, sp); if (idx!=null) idxInByStop.set(sp.id, idx); }});
-      (stops.outbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathOut, sp); if (idx!=null) idxOutByStop.set(sp.id, idx); }});
-
-      if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
-      if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
-
-      // stops layer
-      const stopsLayer = L.layerGroup().addTo(group);
-      const addStops = (arr) => (arr || []).forEach(sp => {
-        if (sp.lat == null || sp.lon == null) return;
-        L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
-        L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan:false })
-          .addTo(stopsLayer);
-      });
-      addStops(stops.inbound); addStops(stops.outbound);
-
-      // fit once
-      const allPts = [...pathIn, ...pathOut];
-      if (allPts.length) {
-        const b = L.latLngBounds(allPts.map(p => L.latLng(p[0], p[1])));
-        map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
-      }
-
-      lineLayers.set(lineId, {
-        group, vehicles, color,
-        pathIn, cumIn, idxInByStop,
-        pathOut, cumOut, idxOutByStop
-      });
-    }
-
-    // ==============================
-    // Vehicles: poll + maintain state
-    // ==============================
-    async function updateVehicles(lines) {
-      await Promise.all(lines.map(ensureRouteLoaded));
-      await Promise.all(lines.map(loadLine));
-    }
-
-    function popupHtml(v) {
-      return (
-        `<b>Route:</b> ${v.route}<br>` +
-        `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-        (v.eta_seconds != null ? `<b>ETA:</b> ${Math.max(0, Math.round(v.eta_seconds/60))} min<br>` : "") +
-        `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-      );
-    }
-
-    async function loadLine(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
-
-      const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const fetchedAtMs = Date.now();      
-      const list = data.vehicles || [];
-      const seen = new Set();
-
-      for (const v of list) {
-        const key = vKey(lineId, v.vehicle_id);
-        seen.add(key);
-
-        const hasPrev = (v.prev_stop_id && v.prev_lat != null && v.prev_lon != null);
-        const hasNext = (v.next_stop_id && v.next_lat != null && v.next_lon != null);
-        if (!hasPrev || !hasNext) continue;
-
-        const dir = (v.direction || "").toLowerCase().startsWith("out") ? "outbound" : "inbound";
-        const path = dir === "outbound" ? pathOut : pathIn;
-        const cum  = dir === "outbound" ? cumOut  : cumIn;
-        const idxMap  = dir === "outbound" ? idxOutByStop : idxInByStop;
-
-        if (!path.length || !cum.length) continue;
-
-        const iPrev = idxMap.get(v.prev_stop_id);
-        const iNext = idxMap.get(v.next_stop_id);
-        if (iPrev == null || iNext == null || iPrev === iNext) continue;
-
-        const startD = cum[iPrev];
-        const endD   = cum[iNext];
-        const length = Math.abs(endD - startD);
-        if (length < 1) continue; // degenerate
-
-        const eta = Math.max(1, Math.min(MAX_ETA_SEC, v.eta_seconds || MIN_SLICE_SEC));
-        const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS); // sec
-        let p0 = 1 - (eta / estDur); // fraction completed toward next stop
-        p0 = Math.max(START_FRACTION_CLAMP[0], Math.min(START_FRACTION_CLAMP[1], p0));
-
-        const dirSign = Math.sign(endD - startD) || 1;
-        const inferredPosD = startD + dirSign * (p0 * length); // place between stops using ETA vs length
-
-        let st = vehicles.get(key);
-
-        if (!st) {
-          // Use polyline tangent heading at placement
-          const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, inferredPosD, 5);
-          const marker = L.marker(
-            pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD),
-            { icon: busIcon(color, angle0) }
-          ).addTo(layers.group)
-           .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
-          st = { marker, meta: null };
-          vehicles.set(key, st);
-        } else {
-          st.marker.getPopup()?.setContent(popupHtml(v));
-        }
-
-        const arrivalAt = fetchedAtMs + eta * 1000;
-
-        if (!st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext) {
-          // New slice: start from inferredPosD; compute speed to hit end at ETA
-          const denom = Math.max(200, arrivalAt - fetchedAtMs); // ms
-          const speed = (endD - inferredPosD) / (denom / 1000); // m/s (signed)
-          st.meta = {
-            dir, iPrev, iNext, path, cum,
-            color,                     // <-- keep line color for animation
-            posD: inferredPosD,
-            speed,
-            lastMs: Date.now(),
-            endD, arrivalAt
-          };
-        } else {
-          // Same slice: advance to 'now', then retune speed so we still reach endD at new arrivalAt
-          const now =  Date.now();
-          const dt = Math.max(0, now - st.meta.lastMs) / 1000;
-          st.meta.posD += st.meta.speed * dt; // advance
-          st.meta.lastMs = now;
-
-          st.meta.endD = endD;
-          st.meta.arrivalAt = arrivalAt;
-          st.meta.color = color;
-
-          const remainingMs = Math.max(200, arrivalAt - now);
-          const remainingDist = st.meta.endD - st.meta.posD;
-          const targetSpeed = remainingDist / (remainingMs / 1000);
-          st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
-
-          const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
-          st.meta.posD = Math.max(minD, Math.min(maxD, st.meta.posD));
-        }
-
-        // Update marker position + polyline-based heading immediately after poll
-        const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
-        const angle = headingOnSlice(st.meta, st.meta.posD, 5);
-        st.marker.setLatLng(ll);
-        st.marker.setIcon(busIcon(color, angle));
-      }
-
-      // Remove stale vehicles (no ghosts)
-      for (const [key, st] of Array.from(vehicles.entries())) {
-        if (!seen.has(key)) {
-          try { st.marker.remove(); } catch {}
-          vehicles.delete(key);
-        }
-      }
-    }
-
-    // ==============================
-    // Animation loop (continuous)
-    // ==============================
-    let rafId = null;
-    function animate() {
-      const now = Date.now();
-      for (const { vehicles } of lineLayers.values()) {
-        for (const st of vehicles.values()) {
-          const { marker, meta } = st;
-          if (!meta) continue;
-
-          const dt = Math.max(0, now - meta.lastMs) / 1000;
-          meta.lastMs = now;
-
-          // advance along slice
-          meta.posD += meta.speed * dt;
-
-          // clamp inside [minD,maxD]
-          const startD = meta.cum[meta.iPrev];
-          const endD = meta.cum[meta.iNext];
-          const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
-          if (meta.posD < minD) meta.posD = minD;
-          if (meta.posD > maxD) meta.posD = maxD;
-
-          const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.iPrev, meta.iNext, meta.posD);
-          const angle = headingOnSlice(meta, meta.posD, 5);
-
-          marker.setLatLng(ll);
-          marker.setIcon(busIcon(meta.color || '#000', angle));
-        }
-      }
-      rafId = requestAnimationFrame(animate);
-    }
-    rafId = requestAnimationFrame(animate);
-
-    // ==============================
-    // UI wiring & boot
-    // ==============================
-    searchEl.addEventListener('input', renderRoutes);
-    clearBtn.addEventListener('click', () => {
-      selected = new Set();
-      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
-      schedulePolling();
-      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+      label.appendChild(cb); label.appendChild(swatch); label.appendChild(idSpan); label.appendChild(nameSpan);
+      routesEl.appendChild(label);
     });
 
-    (async () => {
-      try {
-        const data = await fetchJSON(`${API}/routes`);
-        allRoutes = data;
-        setStatus(`Loaded ${allRoutes.length} routes.`);
-        renderRoutes();
-      } catch (e) {
-        setStatus("Error loading routes: " + e.message, "error");
+    if (filtered.length > 300) {
+      const note = document.createElement('div'); note.className = 'muted'; note.textContent = 'Showing first 300. Refine your search.'; routesEl.appendChild(note);
+    }
+  }
+
+  function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
+
+  function schedulePolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+    // remove lines no longer selected
+    for (const lineId of Array.from(lineLayers.keys())) {
+      if (!selected.has(lineId)) removeRouteLayers(lineId);
+    }
+
+    if (selected.size === 0) {
+      map.eachLayer(l => { if (!(l instanceof L.TileLayer)) map.removeLayer(l); });
+      lineLayers.clear();
+      setStatus("No routes selected. Tick some on the left.", "muted");
+      return;
+    }
+
+    setStatus("Live updating…", "muted");
+    const load = async () => {
+      const lines = Array.from(selected);
+      try { await updateVehicles(lines); }
+      catch (e) { setStatus("Error: " + e.message, "error"); }
+    };
+    load();
+    pollTimer = setInterval(load, 5000);
+  }
+
+  function removeRouteLayers(lineId) {
+    const layers = lineLayers.get(lineId);
+    if (!layers) return;
+    try {
+      if (layers.group && layers.group.clearLayers) layers.group.clearLayers();
+      if (map.hasLayer(layers.group)) map.removeLayer(layers.group);
+    } finally {
+      if (layers.vehiclesState && layers.vehiclesState.clear) layers.vehiclesState.clear();
+      lineLayers.delete(lineId);
+    }
+  }
+
+  async function ensureRouteLoaded(lineId) {
+    if (lineLayers.has(lineId)) return;
+    const color = colorFor(lineId);
+
+    const group = L.featureGroup().addTo(map);
+    const vehiclesState = new Map();
+
+    // Try shape
+    let shape = { inbound: [], outbound: [] };
+    try { shape = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`); }
+    catch (e) { console.warn("shape fetch failed for", lineId, e); }
+
+    const drawMulti = (multi, opts) => {
+      const g = L.layerGroup();
+      (multi || []).forEach(seg => {
+        if (Array.isArray(seg) && seg.length >= 2) L.polyline(seg, opts).addTo(g);
+      });
+      if (g.getLayers().length) g.addTo(group);
+      return g;
+    };
+
+    const poly_in  = drawMulti(shape.inbound,  { color, weight: 4, opacity: 0.85 });
+    const poly_out = drawMulti(shape.outbound, { color, weight: 4, opacity: 0.55, dashArray: "6,6" });
+
+    // Stops
+    const stops = await fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`);
+    const stopsLayer = L.layerGroup().addTo(group);
+    const addStops = (arr) => {
+      (arr || []).forEach(sp => {
+        if (sp.lat == null || sp.lon == null) return;
+        L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
+        L.circleMarker([sp.lat, sp.lon], { radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
+          .bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
+      });
+    };
+    addStops(stops.inbound); addStops(stops.outbound);
+
+    // Fallback if no shape
+    let drewAny = false;
+    if (poly_in && poly_in.getLayers && poly_in.getLayers().length) drewAny = true;
+    if (poly_out && poly_out.getLayers && poly_out.getLayers().length) drewAny = true;
+    if (!drewAny) {
+      const toLatLngs = (arr) => (arr || []).filter(s => s.lat != null && s.lon != null).map(s => [s.lat, s.lon]);
+      L.polyline(toLatLngs(stops.inbound),  { color, weight: 4, opacity: 0.65 }).addTo(group);
+      L.polyline(toLatLngs(stops.outbound), { color, weight: 4, opacity: 0.45, dashArray: "6,6" }).addTo(group);
+    }
+
+    lineLayers.set(lineId, { group, vehiclesState, color });
+
+    if (group.getLayers().length) {
+      const b = group.getBounds?.();
+      if (b && b.isValid()) map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
+    }
+  }
+
+  async function updateVehicles(lines) {
+    try {
+      await Promise.all(lines.map(ensureRouteLoaded));
+      await Promise.all(lines.map(loadLine));
+    } catch (e) { setStatus("Error: " + e.message, "error"); }
+  }
+
+  async function loadLine(lineId) {
+    const layers = lineLayers.get(lineId);
+    if (!layers) return;
+    const { vehiclesState, color } = layers;
+
+    const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
+    const vehicles = data.vehicles || [];
+    const seen = new Set();
+
+    for (const v of vehicles) {
+      const key = `${lineId}::${v.vehicle_id}`;
+      seen.add(key);
+
+      const hasPrev = (v.prev_lat != null && v.prev_lon != null);
+      const hasNext = (v.next_lat != null && v.next_lon != null);
+      if (!hasPrev && !hasNext) continue;
+
+      const pPrev = hasPrev ? [v.prev_lat, v.prev_lon] : [v.next_lat, v.next_lon];
+      const pNext = hasNext ? [v.next_lat, v.next_lon] : [v.prev_lat, v.prev_lon];
+      const rot = bearingDeg(pPrev[0], pPrev[1], pNext[0], pNext[1]);
+
+      let st = vehiclesState.get(key);
+      if (!st) {
+        const m = L.marker(pPrev, { icon: busIcon(color, rot) }).addTo(layers.group);
+        m.bindPopup(
+          `<b>Route:</b> ${v.route}<br>` +
+          `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
+          `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
+          `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
+        );
+        st = { marker: m, meta: {}, color };
+        vehiclesState.set(key, st);
+      } else {
+        st.marker.setIcon(busIcon(color, rot));
+        st.marker.getPopup()?.setContent(
+          `<b>Route:</b> ${v.route}<br>` +
+          `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
+          `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
+          `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
+        );
       }
-    })();
 
-    window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
+      st.meta = { prev: pPrev, next: pNext, startEta: Math.max(v.eta_seconds, 1), syncedAtMs: Date.now() };
+    }
 
-  </script>
+    for (const key of Array.from(vehiclesState.keys())) {
+      if (!seen.has(key)) {
+        vehiclesState.get(key).marker.remove();
+        vehiclesState.delete(key);
+      }
+    }
+  }
+
+  // Animate buses between stops
+  setInterval(() => {
+    for (const { vehiclesState } of lineLayers.values()) {
+      const now = Date.now();
+      for (const st of vehiclesState.values()) {
+        const { marker, meta } = st;
+        if (!meta || !meta.prev || !meta.next) continue;
+        const p = clamp01((now - meta.syncedAtMs) / 1000 / meta.startEta);
+        const lat = lerp(meta.prev[0], meta.next[0], p);
+        const lon = lerp(meta.prev[1], meta.next[1], p);
+        marker.setLatLng([lat, lon]);
+      }
+    }
+  }, 100);
+
+  // UI wiring
+  searchEl.addEventListener('input', renderRoutes);
+  clearBtn.addEventListener('click', () => {
+    selected = new Set();
+    for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
+    schedulePolling();
+    for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+  });
+
+  // Boot
+  (async () => {
+    try {
+      const data = await fetchJSON(`${API}/routes`);
+      allRoutes = data;
+      setStatus(`Loaded ${allRoutes.length} routes.`);
+      renderRoutes();
+    } catch (e) {
+      setStatus("Error loading routes: " + e.message, "error");
+    }
+  })();
+</script>
+
 </body>
 </html>

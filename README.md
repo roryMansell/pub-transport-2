@@ -2,7 +2,7 @@
 
 **A lightweight, framework-free web app** that draws London bus routes and stops, then overlays **live ETAs** per stop. It’s designed to be stable and production-readable: no build tools, minimal code, and clean data plumbing. Optional “beta” markers can show approximate bus positions without glitchy tweening.
 
-- **Live demo (Frontend):** **https://rorymansell.github.io/pub-transport-2/** ← _paste your GitHub Pages URL here_
+- **Live demo (Frontend):** **https://rorymansell.github.io/pub-transport-2/**
 - **Backend (Render):** **https://pub-transport-2.onrender.com** - May need to activate if asleep
 - **Tech:** HTML, CSS, JavaScript (vanilla), Leaflet, OpenStreetMap tiles  
 - **APIs:** TfL Unified API (via a minimal proxy), OSM tiles

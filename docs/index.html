@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (fixed)</title>
+  <title>London Bus RT – Minimal (stable motion)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -44,7 +44,7 @@
     // ==============================
     // Config
     // ==============================
-    const API = "https://pub-transport-2.onrender.com"; // your backend
+    const API = "https://pub-transport-2.onrender.com";
 
     // ==============================
     // DOM/state
@@ -58,7 +58,7 @@
     let selected = new Set();
     let pollTimer = null;
 
-    // Per-route: lineId -> {
+    // lineId -> {
     //   group, vehiclesState(Map), color,
     //   pathIn, cumIn, idxInByStop(Map),
     //   pathOut, cumOut, idxOutByStop(Map)
@@ -182,7 +182,7 @@
     }
 
     // ==============================
-    // Polyline interpolation helpers
+    // Polyline helpers
     // ==============================
     function haversineMeters(a, b) {
       const R = 6371000;
@@ -204,10 +204,11 @@
       while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
       return lo;
     }
-    function pointAtDistanceOnSlice(points, cum, i0, i1, target) {
-      if (i0 === i1) return points[i0];
+    // Works for both forward (iA<iB) and reverse (iA>iB) motion.
+    function pointAtDistanceOnAB(points, cum, iA, iB, targetD) {
+      const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
       const startD = cum[i0], endD = cum[i1];
-      const tDist = Math.max(startD, Math.min(endD, target));
+      const tDist = Math.max(startD, Math.min(endD, targetD));
       const j = lowerBound(cum, i0, i1, tDist);
       if (j === i0) return points[i0];
       const segLen = cum[j] - cum[j-1];
@@ -216,7 +217,7 @@
     }
 
     // ==============================
-    // Load lines (shape + stops) and prep interpolation
+    // Load lines (shape + stops)
     // ==============================
     async function ensureRouteLoaded(lineId) {
       if (lineLayers.has(lineId)) return;
@@ -263,7 +264,7 @@
         if (sp.lat == null || sp.lon == null) return;
         L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
         L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan: false }) // no camera nudge on stop popups either
+          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan: false })
           .addTo(stopsLayer);
       });
       addStops(stops.inbound); addStops(stops.outbound);
@@ -281,7 +282,7 @@
     }
 
     // ==============================
-    // Vehicles: load + animate along polyline slices
+    // Vehicles: load + animate
     // ==============================
     async function updateVehicles(lines) {
       await Promise.all(lines.map(ensureRouteLoaded));
@@ -324,52 +325,58 @@
 
         const iPrev = idxMap.get(v.prev_stop_id);
         const iNext = idxMap.get(v.next_stop_id);
-        if (iPrev == null || iNext == null || iNext === iPrev) continue;
-
-        const i0 = Math.min(iPrev, iNext);
-        const i1 = Math.max(iPrev, iNext);
+        if (iPrev == null || iNext == null || iPrev === iNext) continue;
 
         const rot = bearingDeg(v.prev_lat, v.prev_lon, v.next_lat, v.next_lon);
 
         let st = vehiclesState.get(key);
-        const sameTarget = !!st && st.meta && st.meta.next_stop_id === v.next_stop_id && st.meta.dir === dir;
+        const sameSlice = !!st && st.meta &&
+          st.meta.dir === dir &&
+          st.meta.iPrev === iPrev &&
+          st.meta.iNext === iNext &&
+          st.meta.next_stop_id === v.next_stop_id;
 
+        // Create marker if needed
         if (!st) {
           const m = L.marker([v.prev_lat, v.prev_lon], { icon: busIcon(color, rot) }).addTo(layers.group);
-          // Disable popup autoPan so the map doesn't keep snapping when the marker moves
           m.bindPopup(popupHtml(v), { autoPan: false, closeButton: true, autoClose: false });
-          st = { marker: m, meta: {} };
+          st = { marker: m, meta: null };
           vehiclesState.set(key, st);
         } else {
           st.marker.setIcon(busIcon(color, rot));
           st.marker.getPopup()?.setContent(popupHtml(v));
         }
 
-        // Establish or update timing window
-        const nowSegChanged = !sameTarget;
-        if (nowSegChanged) {
-          // New segment window [startMs, endMs]
-          const startMs = fetchedAtMs - 500; // tiny head start so it doesn't "stick"
-          const endMs   = fetchedAtMs + Math.max(1, v.eta_seconds || 1) * 1000;
-          st.meta = {
-            dir, path: usePath, cum: useCum, i0, i1,
-            next_stop_id: v.next_stop_id,
-            startMs, endMs
-          };
+        const cumA = useCum[iPrev];
+        const cumB = useCum[iNext];
+        const sliceLen = Math.abs(cumB - cumA);
+        const sgn = Math.sign(cumB - cumA) || 1; // +1 forward, -1 backward
 
-          // Place at the start of the new slice (previous stop)
-          const startD = st.meta.cum[i0];
-          const ll = pointAtDistanceOnSlice(st.meta.path, st.meta.cum, i0, i1, startD);
+        if (!sameSlice || !st.meta) {
+          // New slice: start just off the previous stop to avoid "stuck" look
+          const progressD = cumA + sgn * Math.min(2, sliceLen * 0.02); // 2m or 2% nudge
+          const speed = sgn * (sliceLen / Math.max(5, v.eta_seconds || 5)); // m/s
+          st.meta = {
+            dir, iPrev, iNext, next_stop_id: v.next_stop_id,
+            path: usePath, cum: useCum,
+            progressD, speed, lastTickMs: fetchedAtMs
+          };
+          // Place immediately
+          const ll = pointAtDistanceOnAB(st.meta.path, st.meta.cum, iPrev, iNext, progressD);
           st.marker.setLatLng(ll);
         } else {
-          // Same segment: keep startMs to preserve progress. Optionally relax endMs to new ETA if it's later.
-          const suggestedEnd = fetchedAtMs + Math.max(1, v.eta_seconds || 1) * 1000;
-          if (suggestedEnd > st.meta.endMs) {
-            st.meta.endMs = suggestedEnd; // arrival pushed back -> slow down smoothly
-          }
-          // If suggestedEnd is earlier, we keep the old endMs so the bus gently “catches up” instead of snapping back.
-          // Update path indices in case stop->polyline mapping changed slightly
-          st.meta.i0 = i0; st.meta.i1 = i1; st.meta.path = usePath; st.meta.cum = useCum;
+          // Same slice: keep progress, only adjust speed smoothly (no rewinds)
+          const newSpeedAbs = sliceLen / Math.max(5, v.eta_seconds || 5);
+          const targetSpeed = sgn * newSpeedAbs;
+          // Simple smoothing to avoid jank
+          st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
+          st.meta.dir = dir;
+          st.meta.iPrev = iPrev;
+          st.meta.iNext = iNext;
+          st.meta.next_stop_id = v.next_stop_id;
+          st.meta.path = usePath;
+          st.meta.cum = useCum;
+          // do NOT change progressD here
         }
       }
 
@@ -382,21 +389,32 @@
       }
     }
 
-    // animation loop — advance along polyline slices with stable timing
+    // ==============================
+    // Animation loop (progressD + speed)
+    // ==============================
     setInterval(() => {
       const now = Date.now();
       for (const { vehiclesState } of lineLayers.values()) {
         for (const st of vehiclesState.values()) {
           const { marker, meta } = st;
-          if (!meta || !meta.path || !meta.cum || meta.i0 == null || meta.i1 == null || meta.startMs == null || meta.endMs == null) continue;
+          if (!meta || !meta.path || !meta.cum) continue;
 
-          const dur = Math.max(1, meta.endMs - meta.startMs);
-          const p = Math.max(0, Math.min(1, (now - meta.startMs) / dur));
+          const { iPrev, iNext, cum, speed } = meta;
+          if (iPrev == null || iNext == null) continue;
 
-          const startD = meta.cum[meta.i0];
-          const endD   = meta.cum[meta.i1];
-          const target = startD + p * (endD - startD);
-          const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.i0, meta.i1, target);
+          const cumA = cum[iPrev];
+          const cumB = cum[iNext];
+          const i0 = Math.min(iPrev, iNext), i1 = Math.max(iPrev, iNext);
+          const minD = cum[i0], maxD = cum[i1];
+
+          const dt = Math.max(0, now - (meta.lastTickMs || now)) / 1000.0;
+          meta.lastTickMs = now;
+
+          // advance
+          meta.progressD = Math.max(minD, Math.min(maxD, meta.progressD + speed * dt));
+
+          // place
+          const ll = pointAtDistanceOnAB(meta.path, meta.cum, iPrev, iNext, meta.progressD);
           marker.setLatLng(ll);
         }
       }

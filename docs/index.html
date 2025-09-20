@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Tweened (no jumps)</title>
+  <title>London Bus RT – No Jumps (debounced + projected)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell; }
+    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; }
     .app { display:flex; height:100%; }
     .sidebar { width:320px; border-right:1px solid #ddd; padding:12px; overflow:auto; }
     .map { flex:1; }
@@ -18,6 +18,7 @@
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
     .leaflet-pane .vehicle-arrow { z-index: 500; }
     .bus-divicon { pointer-events:auto; } /* keep markers clickable */
+    button { cursor:pointer; }
   </style>
 </head>
 <body>
@@ -53,6 +54,10 @@
     const MAX_ETA_SEC  = 1800;
     const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
 
+    // Staleness tolerance
+    const MAX_MISSES = 3;              // keep vehicle for up to 3 missed polls
+    const SLICE_DEBOUNCE = 2;          // need 2 consecutive polls before accepting a slice change
+
     // ==============================
     // DOM/state
     // ==============================
@@ -83,6 +88,9 @@
     const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
     const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
     const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
+    const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+    const lerp  = (a,b,t) => a + (b-a)*t;
+    const easeInOut = t => (t<0.5 ? 2*t*t : -1+(4-2*t)*t);
 
     function busIcon(color, rotationDeg) {
       const html =
@@ -131,10 +139,6 @@
       while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
       return lo;
     }
-    const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
-    const lerp  = (a,b,t) => a + (b-a)*t;
-    const easeInOut = t => (t<0.5 ? 2*t*t : -1+(4-2*t)*t); // gentle
-
     function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
 
     // LatLng at absolute distance D along [i0..i1] (handles reversed order)
@@ -148,6 +152,7 @@
       const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
       return interpPoint(points[j-1], points[j], clamp(segT, 0, 1));
     }
+
     // Tangent heading along the polyline at posD
     function headingOnSlice(meta, posD, stepMeters = 5) {
       const { path, cum, iPrev, iNext } = meta;
@@ -159,6 +164,31 @@
       const y = Math.sin(Δλ) * Math.cos(φ2);
       const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
       return (toDeg(Math.atan2(y, x)) + 360) % 360;
+    }
+
+    // Project an arbitrary lat/lon onto the slice (nearest point), returning its distance D on cum
+    function projectDistanceOnSlice(points, cum, iPrev, iNext, P) {
+      const i0 = Math.min(iPrev, iNext), i1 = Math.max(iPrev, iNext);
+      let bestDist2 = Infinity, bestD = cum[i0];
+      const toRad = Math.PI/180;
+      for (let j = i0 + 1; j <= i1; j++) {
+        const A = points[j-1], B = points[j];
+        const meanLat = (A[0] + B[0]) * 0.5 * toRad;
+        const ax = 0, ay = 0;
+        const bx = (B[1] - A[1]) * Math.cos(meanLat), by = (B[0] - A[0]);
+        const px = (P[1] - A[1]) * Math.cos(meanLat), py = (P[0] - A[0]);
+        const len2 = bx*bx + by*by;
+        let t = len2 > 0 ? ((px*bx + py*by) / len2) : 0;
+        t = clamp(t, 0, 1);
+        const qx = bx * t, qy = by * t;
+        const dx = px - qx, dy = py - qy;
+        const d2 = dx*dx + dy*dy;
+        if (d2 < bestDist2) {
+          bestDist2 = d2;
+          bestD = cum[j-1] + t * (cum[j] - cum[j-1]);
+        }
+      }
+      return bestD;
     }
 
     // ==============================
@@ -243,7 +273,7 @@
       const color = colorFor(lineId);
 
       const group = L.featureGroup().addTo(map);
-      const vehicles = new Map(); // key -> { marker, meta }
+      const vehicles = new Map(); // key -> { marker, meta, misses, pendingSlice }
 
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
@@ -319,10 +349,11 @@
       );
     }
 
-    // state per vehicle:
-    // meta = {
+    // meta per vehicle:
+    // {
     //   dir, iPrev, iNext, path, cum, color,
-    //   startPosD, targetPosD, animStart, animEnd
+    //   startPosD, targetPosD, animStart, animEnd,
+    //   sliceKey, pendingKey, pendingCount
     // }
     async function loadLine(lineId) {
       const layers = lineLayers.get(lineId);
@@ -364,80 +395,111 @@
         const dirSign = Math.sign(endD - startD) || 1;
         const posNowD = startD + dirSign * (pNow * length);
 
-        // constant avg speed estimate for next interval
-        const speed = dirSign * (length / estDur); // m/s, signed
+        // forward target for next tween window
+        const speed = dirSign * (length / estDur);
         const advance = speed * (POLL_MS / 1000);
         let nextD = posNowD + advance;
-
-        // don't go backwards, don't overshoot end
-        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD);
-        else             nextD = clamp(nextD, endD, posNowD);
+        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD); else nextD = clamp(nextD, endD, posNowD);
 
         let st = vehicles.get(key);
 
+        const sliceKey = `${dir}|${iPrev}|${iNext}`;
         if (!st) {
-          // create marker at posNowD with polyline tangent heading
           const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, posNowD, 5);
           const marker = L.marker(
             pointAtDistanceOnSlice(path, cum, iPrev, iNext, posNowD),
             { icon: busIcon(color, angle0) }
           ).addTo(layers.group).bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
-          st = { marker, meta: null };
-          vehicles.set(key, st);
-          // seed tween
-          st.meta = {
-            dir, iPrev, iNext, path, cum, color,
-            startPosD: posNowD,
-            targetPosD: nextD,
-            animStart: Date.now(),
-            animEnd:   Date.now() + POLL_MS
-          };
-        } else {
-          st.marker.getPopup()?.setContent(popupHtml(v));
-
-          // If slice changed, start new tween from just inside the new slice
-          const sliceChanged = !st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext || st.meta.cum !== cum;
-          if (sliceChanged) {
-            const startDNew = startD;
-            const safeStart = dirSign > 0
-              ? lerp(startDNew, endD, START_FRACTION_CLAMP[0])
-              : lerp(startDNew, endD, 1 - START_FRACTION_CLAMP[0]);
-            st.meta = {
+          st = {
+            marker,
+            meta: {
               dir, iPrev, iNext, path, cum, color,
-              startPosD: safeStart,
+              startPosD: posNowD,
               targetPosD: nextD,
               animStart: Date.now(),
-              animEnd:   Date.now() + POLL_MS
-            };
-            // snap marker to new slice start (inside a bit) to avoid ghost at stop
-            const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.startPosD);
-            const ang= headingOnSlice(st.meta, st.meta.startPosD, 5);
-            st.marker.setLatLng(ll); setMarkerRotation(st.marker, ang);
-          } else {
-            // Same slice: continue from current interpolated position
-            const now = Date.now();
-            const t = clamp((now - st.meta.animStart) / (st.meta.animEnd - st.meta.animStart), 0, 1);
-            const curD = lerp(st.meta.startPosD, st.meta.targetPosD, easeInOut(t));
+              animEnd:   Date.now() + POLL_MS,
+              sliceKey,
+              pendingKey: null,
+              pendingCount: 0
+            },
+            misses: 0
+          };
+          vehicles.set(key, st);
+        } else {
+          st.misses = 0; // seen this poll
+          st.marker.getPopup()?.setContent(popupHtml(v));
 
-            // New tween: start at current tweened position, target = forward nextD (never backwards)
+          // Debounce slice changes
+          if (sliceKey !== st.meta.sliceKey) {
+            if (st.meta.pendingKey === sliceKey) {
+              st.meta.pendingCount += 1;
+            } else {
+              st.meta.pendingKey = sliceKey;
+              st.meta.pendingCount = 1;
+            }
+          } else {
+            st.meta.pendingKey = null;
+            st.meta.pendingCount = 0;
+          }
+
+          const now = Date.now();
+          const tNow = clamp((now - st.meta.animStart) / (st.meta.animEnd - st.meta.animStart), 0, 1);
+          const curD = lerp(st.meta.startPosD, st.meta.targetPosD, easeInOut(tNow));
+
+          const acceptSliceChange =
+            (sliceKey !== st.meta.sliceKey) &&
+            (st.meta.pendingCount >= SLICE_DEBOUNCE);
+
+          if (acceptSliceChange) {
+            // continuity: project current position onto new slice
+            const curLatLng = st.marker.getLatLng();
+            const projD = projectDistanceOnSlice(path, cum, iPrev, iNext, [curLatLng.lat, curLatLng.lng]);
+            const startDNew = projD; // closest point on new slice to where we are now
+
+            // new tween
+            st.meta = {
+              dir, iPrev, iNext, path, cum, color,
+              startPosD: startDNew,
+              targetPosD: nextD,
+              animStart: now,
+              animEnd:   now + POLL_MS,
+              sliceKey,
+              pendingKey: null,
+              pendingCount: 0
+            };
+
+            // snap marker to projected point (tiny move) to avoid visible jump
+            const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, startDNew);
+            const ang= headingOnSlice(st.meta, startDNew, 5);
+            st.marker.setLatLng(ll); setMarkerRotation(st.marker, ang);
+
+          } else {
+            // Same slice: keep moving forward; start from current interpolated pos
             let tgt = nextD;
             if (dirSign > 0) tgt = Math.max(curD, nextD);
             else             tgt = Math.min(curD, nextD);
 
             st.meta = {
-              dir, iPrev, iNext, path, cum, color,
+              ...st.meta,
               startPosD: curD,
               targetPosD: tgt,
               animStart: now,
-              animEnd:   now + POLL_MS
+              animEnd:   now + POLL_MS,
+              color
             };
           }
         }
       }
 
-      // remove stale
+      // Stale vehicles: increment misses, delete only after MAX_MISSES
       for (const [key, st] of Array.from(vehicles.entries())) {
-        if (!seen.has(key)) { try { st.marker.remove(); } catch {} vehicles.delete(key); }
+        if (!seen.has(key)) {
+          st.misses = (st.misses || 0) + 1;
+          if (st.misses >= MAX_MISSES) {
+            try { st.marker.remove(); } catch {}
+            vehicles.delete(key);
+          }
+        }
       }
     }
 
@@ -453,7 +515,6 @@
           if (!meta) continue;
 
           const { path, cum, iPrev, iNext } = meta;
-          const startD = cum[iPrev], endD = cum[iNext];
           let t = (now - meta.animStart) / (meta.animEnd - meta.animStart);
           t = clamp(t, 0, 1);
           const posD = lerp(meta.startPosD, meta.targetPosD, easeInOut(t));
@@ -490,6 +551,8 @@
       }
       schedulePolling();
     })();
+
+    window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
   </script>
 </body>
 </html>

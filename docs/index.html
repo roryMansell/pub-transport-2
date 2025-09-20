@@ -105,9 +105,12 @@
     // Map
     // ==============================
     const map = L.map('map').setView([51.5074, -0.1278], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    const baseTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap', maxZoom: 19
     }).addTo(map);
+
+    // All route groups live under this stable root. Makes cleanup bulletproof.
+    const routesRoot = L.layerGroup().addTo(map);
 
     // ==============================
     // Helpers
@@ -117,7 +120,9 @@
     const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
     const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
     const lerp  = (a,b,t) => a + (b-a)*t;
-    const normId = x => String(x).trim(); // <— normalize route ids everywhere
+    const normId = x => String(x).trim(); // normalize ids
+
+    function tagLayer(layer, lineId) { try { layer._routeId = lineId; } catch {} return layer; }
 
     function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
     async function fetchJSON(url) {
@@ -209,25 +214,25 @@
 
       routesEl.innerHTML = "";
       filtered.slice(0, 300).forEach(r => {
+        const idNorm = normId(r.id);
         const label = document.createElement('label');
         label.className = 'route-item';
 
         const swatch = document.createElement('span');
-        Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(r.id) });
+        Object.assign(swatch.style, { display:'inline-block', width:'10px', height:'10px', borderRadius:'50%', background: colorFor(idNorm) });
 
         const cb = document.createElement('input');
         cb.type = 'checkbox';
-        cb.checked = selected.has(normId(r.id));
+        cb.checked = selected.has(idNorm);
         cb.addEventListener('change', () => {
-          const id = normId(r.id);
           if (cb.checked) {
-            selected.add(id);
-            ensureRouteLoaded(id);
+            selected.add(idNorm);
+            ensureRouteLoaded(idNorm);
           } else {
-            selected.delete(id);
-            removeRouteLayers(id);
+            selected.delete(idNorm);
+            removeRouteLayers(idNorm);   // <- immediate & robust
           }
-          schedulePolling();
+          schedulePolling();              // <- refresh polling set
         });
 
         const idSpan = document.createElement('span'); idSpan.className = 'route-id'; idSpan.textContent = r.id;
@@ -245,24 +250,33 @@
     }
 
     // ==============================
-    // Removal helpers (hard clear)
+    // Removal helpers (hard & tagged)
     // ==============================
     function removeRouteLayers(lineIdRaw) {
       const lineId = normId(lineIdRaw);
       const layers = lineLayers.get(lineId);
-      if (!layers) return;
 
-      const { group, vehicleLayer, stopsLayer } = layers;
+      // 1) If we have a known group, nuke it
+      if (layers && layers.group) {
+        try { layers.vehicleLayer?.clearLayers?.(); } catch {}
+        try { layers.stopsLayer?.clearLayers?.(); } catch {}
+        try { layers.group?.clearLayers?.(); } catch {}
+        try { routesRoot.removeLayer(layers.group); } catch {}
+      }
 
-      try { vehicleLayer && vehicleLayer.clearLayers && vehicleLayer.clearLayers(); } catch {}
-      try { stopsLayer && stopsLayer.clearLayers && stopsLayer.clearLayers(); } catch {}
-      try { group && group.clearLayers && group.clearLayers(); } catch {}
-
-      try { map.removeLayer(group); } catch {}
+      // 2) Defensive: remove anything on the map tagged with this routeId
       try {
-        map.eachLayer(l => { if (!(l instanceof L.TileLayer) && l === group) map.removeLayer(l); });
+        routesRoot.eachLayer(l => { if (l && l._routeId === lineId) routesRoot.removeLayer(l); });
+        map.eachLayer(l => {
+          if (l && l._routeId === lineId) { try { map.removeLayer(l); } catch {} }
+          // also remove any nested children that got added directly to map by accident
+          if (l && l.getLayers) {
+            l.getLayers().forEach(ch => { if (ch && ch._routeId === lineId) { try { l.removeLayer(ch); } catch {} } });
+          }
+        });
       } catch {}
 
+      // 3) Forget the record
       lineLayers.delete(lineId);
     }
 
@@ -270,7 +284,11 @@
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       for (const id of Array.from(lineLayers.keys())) removeRouteLayers(id);
       lineLayers.clear();
-      map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { map.removeLayer(l); } catch {} } });
+
+      // ensure only base tiles remain
+      map.eachLayer(l => { if (l !== baseTiles) { try { map.removeLayer(l); } catch {} } });
+      routesRoot.clearLayers();
+      routesRoot.addTo(map);
     }
 
     // ==============================
@@ -281,8 +299,8 @@
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
 
-      const group = L.featureGroup().addTo(map);
-      const vehicleLayer = L.layerGroup().addTo(group);
+      const group = tagLayer(L.featureGroup(), lineId).addTo(routesRoot);
+      const vehicleLayer = tagLayer(L.layerGroup(), lineId).addTo(group);
 
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
@@ -339,16 +357,16 @@
       });
 
       // polylines
-      if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
-      if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
+      if (pathIn.length)  tagLayer(L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }), lineId).addTo(group);
+      if (pathOut.length) tagLayer(L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }), lineId).addTo(group);
 
       // stops (we'll recolor by ETA later)
-      const stopsLayer = L.layerGroup().addTo(group);
+      const stopsLayer = tagLayer(L.layerGroup(), lineId).addTo(group);
       function addStops(arr, dirLabel) {
         (arr || []).forEach(sp => {
           if (sp.lat == null || sp.lon == null) return;
-          const ring = L.circleMarker([sp.lat, sp.lon], { radius: 6, color:'#0000', weight:0, fillColor:'#000', fillOpacity:0.08 }).addTo(stopsLayer);
-          const cm = L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor:'#bbb', fillOpacity:1 });
+          const ring = tagLayer(L.circleMarker([sp.lat, sp.lon], { radius: 6, color:'#0000', weight:0, fillColor:'#000', fillOpacity:0.08 }), lineId).addTo(stopsLayer);
+          const cm = tagLayer(L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor:'#bbb', fillOpacity:1 }), lineId);
           cm.bindPopup(`<b>${sp.name || "Stop"}</b><br><small>${dirLabel}</small>`, { autoPan:false });
           cm.addTo(stopsLayer);
           sp._ring = ring; sp._cm = cm; // keep refs for recolor
@@ -364,7 +382,7 @@
       }
 
       lineLayers.set(lineId, {
-        group, color,
+        group: tagLayer(group, lineId), color,
         pathIn, cumIn, idxInByStop, stopsIn, dInByStop,
         pathOut, cumOut, idxOutByStop, stopsOut, dOutByStop,
         stopsLayer, vehicleLayer
@@ -417,19 +435,6 @@
       if (stop._cm && stop._cm._map) {
         stop._cm.setStyle({ fillColor: fill });
       }
-    }
-
-    function busMarkerAt(path, cum, iPrev, iNext, etaSeconds) {
-      const startD = cum[iPrev], endD = cum[iNext];
-      const length = Math.abs(endD - startD);
-      const estDur = Math.max(20, length / AVG_SPEED_MPS);
-      let p = 1 - (etaSeconds / estDur);
-      p = clamp(p, 0.02, 0.98);
-      const dirSign = Math.sign(endD - startD) || 1;
-      const posD = startD + dirSign * (p * length);
-      const latlng = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD);
-      const angle = headingOnSlice({ path, cum, iPrev, iNext }, posD, 5);
-      return { latlng, angle };
     }
 
     async function updateLineETAs(lineIdRaw) {
@@ -485,7 +490,7 @@
           const latlng = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD);
           const angle  = headingOnSlice({ path, cum, iPrev, iNext }, posD, 5);
 
-          L.marker(latlng, { icon: busIcon(color, angle) })
+          tagLayer(L.marker(latlng, { icon: busIcon(color, angle) }), lineId)
             .addTo(vehicleLayer)
             .bindPopup(
               `<b>${v.route}</b> • ${v.direction}<br>` +
@@ -515,7 +520,6 @@
     }
 
     function renderArrivals(rows) {
-      // only show arrivals for currently selected lines
       const selectedIds = new Set(selected);
       const filtered = rows.filter(r => selectedIds.has(normId(r.lineId)));
       filtered.sort((a,b)=> a.mins - b.mins);

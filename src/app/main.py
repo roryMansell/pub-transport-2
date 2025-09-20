@@ -179,33 +179,45 @@ ORS_TOKEN = os.getenv("ORS_TOKEN")
 @app.get("/line/{line_id}/shape")
 async def line_shape(line_id: str):
     """
-    Road-following shape using ORS Directions (no cache).
-    Falls back to straight stops if ORS fails.
+    Road-following shape using ORS Directions.
+    Cache policy:
+      - TfL stop sequences: 10 minutes
+      - ORS shapes (per direction): 24 hours, ONLY when ORS succeeds
+      - Fallback straight lines: not cached (so we recover as soon as ORS works)
     """
+    import os, httpx, logging, time
+
+    logger = logging.getLogger("uvicorn.error")
     ORS_BASE = "https://api.openrouteservice.org/v2/directions/driving-car"
     ORS_TOKEN = os.getenv("ORS_TOKEN")
 
+    # -------- utils --------
     def simplify(seq_json):
         pts = []
         for s in (seq_json or {}).get("stopPointSequences", []):
             for sp in s.get("stopPoint", []):
                 lat, lon = sp.get("lat"), sp.get("lon")
                 if lat is not None and lon is not None:
-                    pts.append((float(lat), float(lon)))
+                    pts.append((float(lat), float(lon)))  # (lat, lon)
         return pts
 
-    async def fetch_seq(direction: str):
-        url = f"{TFL_BASE}/Line/{line_id}/Route/Sequence/{direction}"
-        async with httpx.AsyncClient(timeout=20.0, headers=HTTP_HEADERS) as c:
-            r = await c.get(url, params=tfl_params())
-            r.raise_for_status()
-            return r.json()
+    def downsample_to_max(coords_lonlat, max_n=50):
+        n = len(coords_lonlat)
+        if n <= max_n:
+            return coords_lonlat
+        out = []
+        for k in range(max_n):
+            idx = round(k * (n - 1) / (max_n - 1))
+            out.append(coords_lonlat[idx])
+        # dedupe consecutive duplicates (rare)
+        dedup = [out[0]]
+        for p in out[1:]:
+            if p != dedup[-1]:
+                dedup.append(p)
+        return dedup
 
-    inbound_json, outbound_json = await fetch_seq("inbound"), await fetch_seq("outbound")
-    inbound_pts, outbound_pts = simplify(inbound_json), simplify(outbound_json)
-
-    def decode_polyline(enc):
-        """Decode ORS encoded polyline to [[lat, lon], ...]."""
+    def decode_polyline(enc: str):
+        """Decode ORS/Google encoded polyline to [[lat, lon], ...] (1e-5 precision)."""
         coords, index, lat, lon = [], 0, 0, 0
         while index < len(enc):
             shift, result = 0, 0
@@ -222,44 +234,91 @@ async def line_shape(line_id: str):
                 if b < 0x20: break
             dlon = ~(result >> 1) if (result & 1) else (result >> 1)
             lon += dlon
-            coords.append([lat / 1e5, lon / 1e5])
+            coords.append([lat / 1e-5 / 1e5 if False else lat / 1e5, lon / 1e5])  # keep 1e-5
         return coords
 
-    async def ors_route(points_latlon):
+    # -------- cached TfL sequences (10 min) --------
+    def build_raw():
+        with httpx.Client(timeout=20.0, headers=HTTP_HEADERS) as c:
+            rin = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/inbound", params=tfl_params()); rin.raise_for_status()
+            rout = c.get(f"{TFL_BASE}/Line/{line_id}/Route/Sequence/outbound", params=tfl_params()); rout.raise_for_status()
+            return rin.json(), rout.json()
+
+    inbound_json, outbound_json = memo(f"rawstops:{line_id}", 600, build_raw)
+    inbound_pts, outbound_pts = simplify(inbound_json), simplify(outbound_json)
+
+    # -------- ORS call (cache success for 24h) --------
+    def ors_route_sync(points_latlon, cache_key):
+        """Return (shape_latlon, source). On ORS failure, raise to avoid caching."""
         if len(points_latlon) < 2:
-            return [], "too-few-points"
+            raise RuntimeError("too-few-points")
         if not ORS_TOKEN:
-            return [], "no-token"
+            raise RuntimeError("no-token")
 
-        coords = [[lon, lat] for (lat, lon) in points_latlon]
-        body = {"coordinates": coords, "instructions": False}
-        headers = {"Authorization": ORS_TOKEN, "Content-Type": "application/json"}
+        coords_lonlat = [[lon, lat] for (lat, lon) in points_latlon]
+        coords_lonlat = downsample_to_max(coords_lonlat, 50)
 
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            r = await c.post(ORS_BASE, json=body, headers=headers)
+        def build():
+            body = {
+                "coordinates": coords_lonlat,
+                "instructions": False,  # smaller payload
+                "geometry": True
+            }
+            headers = {"Authorization": ORS_TOKEN, "Content-Type": "application/json"}
 
-        if r.status_code == 429:
-            return [], "quota"
-        if r.status_code >= 400:
-            return [], f"bad-request:{r.text[:120]}"
+            with httpx.Client(timeout=30.0) as c:
+                r = c.post(ORS_BASE, json=body, headers=headers)
 
-        data = r.json()
-        geom = data.get("routes", [{}])[0].get("geometry")
+            # log raw ORS response (first 500 chars)
+            try:
+                logger.info("ORS route resp (status %s) %s", r.status_code, r.text[:500])
+            except Exception:
+                pass
 
-        if isinstance(geom, dict) and "coordinates" in geom:
-            return [[lat, lon] for lon, lat in geom["coordinates"]], "ors-geojson"
-        elif isinstance(geom, str):
-            coords = decode_polyline(geom)
-            return coords, "ors-polyline"
-        return [], "no-geometry"
+            if r.status_code == 429:
+                # quota → propagate as error so we DON'T cache
+                raise RuntimeError("quota")
+            if r.status_code >= 400:
+                # propagate error detail (also not cached)
+                raise RuntimeError(f"bad-request:{(r.text or '')[:200]}")
 
-    in_shape, in_src = await ors_route(inbound_pts)
-    out_shape, out_src = await ors_route(outbound_pts)
+            data = r.json()
+            geom = data.get("routes", [{}])[0].get("geometry")
 
-    if not in_shape and inbound_pts:
-        in_shape, in_src = inbound_pts, "fallback"
-    if not out_shape and outbound_pts:
-        out_shape, out_src = outbound_pts, "fallback"
+            # geometry may be dict with coordinates OR encoded string
+            if isinstance(geom, dict) and "coordinates" in geom:
+                coords = [[lat, lon] for lon, lat in geom["coordinates"]]
+                if not coords:
+                    raise RuntimeError("no-geometry")
+                return coords  # success → memo will cache 24h
+            elif isinstance(geom, str):
+                coords = decode_polyline(geom)
+                if not coords:
+                    raise RuntimeError("decode-failed")
+                return coords  # success → memo will cache 24h
+
+            raise RuntimeError("no-geometry")
+
+        # IMPORTANT: using memo here means ONLY success (no exception) gets cached.
+        shape = memo(cache_key, 86400, build)  # 24h cache on success
+        return shape, "ors"
+
+    # Try ORS with success-only caching; if it raises, fall back (not cached)
+    try:
+        in_shape, in_src = ors_route_sync(inbound_pts,  f"ors:shape:{line_id}:in")
+    except Exception as e:
+        in_shape, in_src = inbound_pts if inbound_pts else [], str(e)
+
+    try:
+        out_shape, out_src = ors_route_sync(outbound_pts, f"ors:shape:{line_id}:out")
+    except Exception as e:
+        out_shape, out_src = outbound_pts if outbound_pts else [], str(e)
+
+    # Normalize sources: if we returned stops, mark as 'fallback'
+    if in_shape == inbound_pts:
+        in_src = "fallback" if in_src == "ors" else in_src or "fallback"
+    if out_shape == outbound_pts:
+        out_src = "fallback" if out_src == "ors" else out_src or "fallback"
 
     return {
         "line_id": line_id,
@@ -267,6 +326,7 @@ async def line_shape(line_id: str):
         "outbound": [out_shape] if out_shape else [],
         "meta": {"in_source": in_src, "out_source": out_src}
     }
+
 
 
 

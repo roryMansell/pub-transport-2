@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (solid)</title>
+  <title>London Bus RT – Minimal (smooth + correct start)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -28,10 +28,10 @@
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">Tick routes to load vehicles. Map updates every 5s; animation is continuous.</div>
+      <div class="muted">Tick routes to load vehicles. Polls every 5s; animation is continuous.</div>
       <div class="muted" style="margin-bottom:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
-        Stops are white dots with a colored ring. Buses are colored arrows that move along the route.
+        Stops are white dots with a colored ring. Buses are colored arrows moving along the route.
       </div>
       <div id="status" class="loading">Loading routes…</div>
       <div id="routes"></div>
@@ -45,6 +45,10 @@
     // Config
     // ==============================
     const API = "https://pub-transport-2.onrender.com";
+    const AVG_SPEED_MPS = 7;         // ~25 km/h typical moving speed (tweak if you like)
+    const MIN_SLICE_SEC = 20;        // minimum plausible travel time between stops
+    const MAX_ETA_SEC = 1800;        // guardrail
+    const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
 
     // ==============================
     // DOM/state
@@ -59,7 +63,7 @@
     let pollTimer = null;
 
     // lineId -> {
-    //   group, vehiclesState(Map), color,
+    //   group, vehicles(Map), color,
     //   pathIn, cumIn, idxInByStop(Map),
     //   pathOut, cumOut, idxOutByStop(Map)
     // }
@@ -79,15 +83,7 @@
     // ==============================
     const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=((h<<5)-h)+s.charCodeAt(i); h|=0; } return Math.abs(h); };
     const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
-
-    function bearingDeg(lat1, lon1, lat2, lon2) {
-      const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
-      const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
-      const y = Math.sin(Δλ) * Math.cos(φ2);
-      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-      let brng = toDeg(Math.atan2(y, x));
-      return (brng + 360) % 360;
-    }
+    const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
 
     function busIcon(color, rotationDeg) {
       const html =
@@ -103,6 +99,15 @@
       return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
     }
 
+    function bearingDeg(lat1, lon1, lat2, lon2) {
+      const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
+      const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2 - lon1);
+      const y = Math.sin(Δλ) * Math.cos(φ2);
+      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+      let brng = toDeg(Math.atan2(y, x));
+      return (brng + 360) % 360;
+    }
+
     async function fetchJSON(url) {
       const r = await fetch(url, { mode: "cors" });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
@@ -111,10 +116,55 @@
 
     function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
 
-    function normalizeKey(lineId, vehicleId) {
-      return `${String(lineId).trim()}::${String(vehicleId).trim()}`;
+    // ==============================
+    // Polyline helpers
+    // ==============================
+    function haversineMeters(a, b) {
+      const R = 6371000;
+      const toRad = x => x * Math.PI / 180;
+      const dLat = toRad(b[0] - a[0]);
+      const dLon = toRad(b[1] - a[1]);
+      const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+      const s = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(s));
+    }
+    function cumulativeDistances(points) {
+      const cum = [0];
+      for (let i = 1; i < points.length; i++) cum[i] = cum[i-1] + haversineMeters(points[i-1], points[i]);
+      return cum;
+    }
+    function lowerBound(cum, lo, hi, target) {
+      lo = Math.max(0, lo); hi = Math.min(cum.length-1, hi);
+      while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
+      return lo;
+    }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
+
+    // return LatLng at absolute distance D along [i0..i1] (handles reversed order)
+    function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
+      const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
+      const startD = cum[i0], endD = cum[i1];
+      const tDist = Math.max(startD, Math.min(endD, targetD));
+      const j = lowerBound(cum, i0, i1, tDist);
+      if (j === i0) return points[i0];
+      const segLen = cum[j] - cum[j-1];
+      const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
+      return interpPoint(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
     }
 
+    // small step ahead/behind along slice, for heading
+    function pointAheadBehind(meta, posD, stepMeters) {
+      const { path, cum, iPrev, iNext } = meta;
+      const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
+      const pBehind = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - stepMeters*dirSign);
+      const pAhead  = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + stepMeters*dirSign);
+      return { pBehind, pAhead };
+    }
+
+    // ==============================
+    // UI
+    // ==============================
     function renderRoutes() {
       const q = (searchEl.value || "").trim().toLowerCase();
       const filtered = q
@@ -158,6 +208,7 @@
       }
 
       if (selected.size === 0) {
+        // remove all non-tile layers
         map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { l.remove(); } catch { map.removeLayer(l); } } });
         setStatus("No routes selected. Tick some on the left.", "muted");
         return;
@@ -186,40 +237,6 @@
     }
 
     // ==============================
-    // Polyline helpers
-    // ==============================
-    function haversineMeters(a, b) {
-      const R = 6371000;
-      const toRad = x => x * Math.PI / 180;
-      const dLat = toRad(b[0] - a[0]);
-      const dLon = toRad(b[1] - a[1]);
-      const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
-      const s = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
-      return 2 * R * Math.asin(Math.sqrt(s));
-    }
-    function cumulativeDistances(points) {
-      const cum = [0];
-      for (let i = 1; i < points.length; i++) cum[i] = cum[i-1] + haversineMeters(points[i-1], points[i]);
-      return cum;
-    }
-    function interpolateBetween(a, b, t) { return [a[0] + (b[0]-a[0]) * t, a[1] + (b[1]-a[1]) * t]; }
-    function lowerBound(cum, lo, hi, target) {
-      lo = Math.max(0, lo); hi = Math.min(cum.length-1, hi);
-      while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
-      return lo;
-    }
-    function pointAtDistanceOnAB(points, cum, iA, iB, targetD) {
-      const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
-      const startD = cum[i0], endD = cum[i1];
-      const tDist = Math.max(startD, Math.min(endD, targetD));
-      const j = lowerBound(cum, i0, i1, tDist);
-      if (j === i0) return points[i0];
-      const segLen = cum[j] - cum[j-1];
-      const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
-      return interpolateBetween(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
-    }
-
-    // ==============================
     // Load lines (shape + stops)
     // ==============================
     async function ensureRouteLoaded(lineId) {
@@ -227,7 +244,7 @@
       const color = colorFor(lineId);
 
       const group = L.featureGroup().addTo(map);
-      const vehiclesState = new Map();
+      const vehicles = new Map(); // key -> { marker, meta }
 
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
@@ -236,7 +253,8 @@
 
       const pickPath = (segments) => {
         let best = null;
-        for (const s of (segments || [])) if (Array.isArray(s) && s.length >= 2) best = !best || s.length > best.length ? s : best;
+        for (const s of (segments || [])) if (Array.isArray(s) && s.length >= 2)
+          best = !best || s.length > best.length ? s : best;
         return best || [];
       };
       const pathIn = pickPath(shape.inbound);
@@ -245,6 +263,7 @@
       const cumIn  = pathIn.length  ? cumulativeDistances(pathIn)  : [];
       const cumOut = pathOut.length ? cumulativeDistances(pathOut) : [];
 
+      // map stop id -> nearest index on its direction path
       const nearestIndex = (path, stop) => {
         if (!path.length) return null;
         let bestIdx = 0, bestD = Infinity;
@@ -262,30 +281,33 @@
       if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
       if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
 
+      // stops layer
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => (arr || []).forEach(sp => {
         if (sp.lat == null || sp.lon == null) return;
         L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
         L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan: false })
+          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan:false })
           .addTo(stopsLayer);
       });
       addStops(stops.inbound); addStops(stops.outbound);
 
+      // fit once
       const allPts = [...pathIn, ...pathOut];
       if (allPts.length) {
         const b = L.latLngBounds(allPts.map(p => L.latLng(p[0], p[1])));
         map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
       }
 
-      lineLayers.set(lineId, { group, vehiclesState, color,
+      lineLayers.set(lineId, {
+        group, vehicles, color,
         pathIn, cumIn, idxInByStop,
         pathOut, cumOut, idxOutByStop
       });
     }
 
     // ==============================
-    // Vehicles: poll + maintain segment windows
+    // Vehicles: poll + maintain state
     // ==============================
     async function updateVehicles(lines) {
       await Promise.all(lines.map(ensureRouteLoaded));
@@ -301,26 +323,19 @@
       );
     }
 
-    function projectNow(meta, nowMs) {
-      const { startMs, endMs, startD, endD } = meta;
-      const dur = Math.max(1, endMs - startMs);
-      const p = Math.max(0, Math.min(1, (nowMs - startMs) / dur));
-      return startD + (endD - startD) * p;
-    }
-
     async function loadLine(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
-      const { vehiclesState, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
+      const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
       const fetchedAtMs = Date.parse(data.fetched_at || new Date().toISOString());
-      const vehicles = data.vehicles || [];
-      const seenKeys = new Set();
+      const list = data.vehicles || [];
+      const seen = new Set();
 
-      for (const v of vehicles) {
-        const key = normalizeKey(lineId, v.vehicle_id);
-        seenKeys.add(key);
+      for (const v of list) {
+        const key = vKey(lineId, v.vehicle_id);
+        seen.add(key);
 
         const hasPrev = (v.prev_stop_id && v.prev_lat != null && v.prev_lon != null);
         const hasNext = (v.next_stop_id && v.next_lat != null && v.next_lon != null);
@@ -337,91 +352,114 @@
         const iNext = idxMap.get(v.next_stop_id);
         if (iPrev == null || iNext == null || iPrev === iNext) continue;
 
+        const startD = cum[iPrev];
+        const endD   = cum[iNext];
+        const length = Math.abs(endD - startD);
+        if (length < 1) continue; // degenerate
+
+        const eta = Math.max(1, Math.min(MAX_ETA_SEC, v.eta_seconds || MIN_SLICE_SEC));
+        const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS); // sec
+        let p0 = 1 - (eta / estDur); // fraction completed toward next stop
+        p0 = Math.max(START_FRACTION_CLAMP[0], Math.min(START_FRACTION_CLAMP[1], p0));
+
+        const dirSign = Math.sign(endD - startD) || 1;
+        const inferredPosD = startD + dirSign * (p0 * length); // place between stops using ETA vs length
+
+        let st = vehicles.get(key);
         const rot = bearingDeg(v.prev_lat, v.prev_lon, v.next_lat, v.next_lon);
-        const cumA = cum[iPrev], cumB = cum[iNext];
 
-        let st = vehiclesState.get(key);
-
-        // create marker once
         if (!st) {
-          const m = L.marker([v.prev_lat, v.prev_lon], { icon: busIcon(color, rot) }).addTo(layers.group);
-          m.bindPopup(popupHtml(v), { autoPan: false, closeButton: true, autoClose: false });
-          st = { marker: m, meta: null };
-          vehiclesState.set(key, st);
+          const marker = L.marker(pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD), { icon: busIcon(color, rot) })
+            .addTo(layers.group)
+            .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
+          st = { marker, meta: null };
+          vehicles.set(key, st);
         } else {
-          st.marker.setIcon(busIcon(color, rot));
           st.marker.getPopup()?.setContent(popupHtml(v));
         }
 
-        const etaSec = Math.max(1, v.eta_seconds || 1);
-        const newEndMs = fetchedAtMs + etaSec * 1000;
+        const arrivalAt = fetchedAtMs + eta * 1000;
 
-        // Establish / update segment window
-        if (!st.meta) {
+        if (!st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext) {
+          // New slice: start from inferredPosD; compute speed to hit end at ETA
+          const denom = Math.max(200, arrivalAt - fetchedAtMs); // ms
+          const speed = (endD - inferredPosD) / (denom / 1000); // m/s (signed)
           st.meta = {
-            dir, iPrev, iNext, next_stop_id: v.next_stop_id,
-            path, cum,
-            startMs: fetchedAtMs - 300, // slight head start
-            endMs: newEndMs,
-            startD: cumA,
-            endD: cumB
+            dir, iPrev, iNext, path, cum,
+            posD: inferredPosD,
+            speed,
+            lastMs: fetchedAtMs,
+            endD, arrivalAt
           };
-          // place immediately at tiny offset from start to avoid "on-stop" look
-          const tiny = Math.max(2, Math.abs(cumB - cumA) * 0.02);
-          const initD = cumA < cumB ? cumA + tiny : cumA - tiny;
-          const ll = pointAtDistanceOnAB(path, cum, iPrev, iNext, initD);
-          st.marker.setLatLng(ll);
         } else {
-          const sameSlice = st.meta.dir === dir && st.meta.iPrev === iPrev && st.meta.iNext === iNext && st.meta.next_stop_id === v.next_stop_id;
+          // Same slice: advance to 'now', then retune speed so we still reach endD at new arrivalAt
           const now = fetchedAtMs;
+          const dt = Math.max(0, now - st.meta.lastMs) / 1000;
+          st.meta.posD += st.meta.speed * dt; // advance
+          st.meta.lastMs = now;
 
-          if (sameSlice) {
-            // Keep current progress, only relax/advance endMs
-            const currD = projectNow(st.meta, now);
-            st.meta.startD = currD;
-            st.meta.endD = cumB;
-            st.meta.startMs = now;
-            // if ETA increased, endMs goes later; if it decreased, we bring it forward (no backward jump in distance)
-            st.meta.endMs = newEndMs;
-            st.meta.path = path; st.meta.cum = cum;
-          } else {
-            // New slice: begin from current projected position on old slice, not the stop
-            const currD = projectNow(st.meta, now);
-            st.meta = {
-              dir, iPrev, iNext, next_stop_id: v.next_stop_id,
-              path, cum,
-              startMs: now,
-              endMs: newEndMs,
-              startD: currD,
-              endD: cumB
-            };
-          }
+          st.meta.endD = endD;
+          st.meta.arrivalAt = arrivalAt;
+
+          const remainingMs = Math.max(200, arrivalAt - now);
+          const remainingDist = st.meta.endD - st.meta.posD;
+          // smooth speed change to avoid jolts
+          const targetSpeed = remainingDist / (remainingMs / 1000);
+          st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
+
+          // keep within slice limits
+          const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
+          st.meta.posD = Math.max(minD, Math.min(maxD, st.meta.posD));
         }
+
+        // Update marker position + heading right away
+        const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
+        const { pBehind, pAhead } = pointAheadBehind(st.meta, st.meta.posD, 3); // 3m step for heading
+        const hdg = bearingDeg(pBehind[0], pBehind[1], pAhead[0], pAhead[1]);
+        st.marker.setLatLng(ll);
+        st.marker.setIcon(busIcon(color, hdg));
       }
 
-      // Remove stale vehicles for this line
-      for (const [key, st] of Array.from(vehiclesState.entries())) {
-        if (!seenKeys.has(key)) {
+      // Remove stale vehicles (no ghosts)
+      for (const [key, st] of Array.from(vehicles.entries())) {
+        if (!seen.has(key)) {
           try { st.marker.remove(); } catch {}
-          vehiclesState.delete(key);
+          vehicles.delete(key);
         }
       }
     }
 
     // ==============================
-    // Animation loop (requestAnimationFrame)
+    // Animation loop (continuous)
     // ==============================
     let rafId = null;
     function animate() {
       const now = Date.now();
-      for (const { vehiclesState } of lineLayers.values()) {
-        for (const st of vehiclesState.values()) {
+      for (const { vehicles } of lineLayers.values()) {
+        for (const st of vehicles.values()) {
           const { marker, meta } = st;
-          if (!meta || !meta.path || !meta.cum) continue;
+          if (!meta) continue;
 
-          const currD = projectNow(meta, now);
-          const ll = pointAtDistanceOnAB(meta.path, meta.cum, meta.iPrev, meta.iNext, currD);
+          const dt = Math.max(0, now - meta.lastMs) / 1000;
+          meta.lastMs = now;
+
+          // advance along slice
+          meta.posD += meta.speed * dt;
+
+          // clamp inside [minD,maxD]
+          const startD = meta.cum[meta.iPrev];
+          const endD = meta.cum[meta.iNext];
+          const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
+          if (meta.posD < minD) meta.posD = minD;
+          if (meta.posD > maxD) meta.posD = maxD;
+
+          const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.iPrev, meta.iNext, meta.posD);
+          const { pBehind, pAhead } = pointAheadBehind(meta, meta.posD, 3);
+          const hdg = bearingDeg(pBehind[0], pBehind[1], pAhead[0], pAhead[1]);
+
           marker.setLatLng(ll);
+          marker.setIcon(busIcon(marker.options.icon.options.html.includes('border-bottom') ? '#000' : '#000', hdg)); // keep rotation
+          // ^^ We re-create icon only to update rotation; color is baked in HTML, so we keep it black in style above.
         }
       }
       rafId = requestAnimationFrame(animate);
@@ -450,8 +488,8 @@
       }
     })();
 
-    // Clean up RAF on unload
     window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
+
   </script>
 </body>
 </html>

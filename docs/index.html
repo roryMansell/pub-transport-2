@@ -2,40 +2,68 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – No Jumps (debounced + projected + sane speed)</title>
+  <title>London Bus RT – Route ETAs (stable demo)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; }
+    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell; }
     .app { display:flex; height:100%; }
-    .sidebar { width:320px; border-right:1px solid #ddd; padding:12px; overflow:auto; }
+    .sidebar { width:360px; border-right:1px solid #ddd; padding:12px; overflow:auto; }
     .map { flex:1; }
-    .row { display:flex; gap:6px; margin-bottom:8px; }
-    .muted { color:#666; font-size:12px; margin-bottom:8px; }
-    .route-item { display:flex; align-items:center; gap:8px; padding:3px 0; }
-    .route-id { font-family: ui-monospace, Menlo, Consolas, monospace; width:56px; }
+    .row { display:flex; gap:8px; margin-bottom:10px; }
+    .muted { color:#666; font-size:12px; margin:6px 0; }
+    .section-title { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:#555; margin:10px 0 6px; }
+    .route-item { display:flex; align-items:center; gap:8px; padding:4px 0; }
+    .route-id { font-family: ui-monospace, Menlo, Consolas, monospace; width:60px; }
     .loading { font-size:12px; color:#888; }
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
+    .eta-list { border:1px solid #eee; border-radius:8px; padding:8px; }
+    .eta-row { display:flex; align-items:center; justify-content:space-between; padding:6px 0; border-top:1px dashed #eee; }
+    .eta-row:first-child { border-top:none; }
+    .eta-stop { display:flex; flex-direction:column; }
+    .eta-stop .name { font-weight:600; }
+    .eta-stop .dir { font-size:12px; color:#666; }
+    .eta-badge { font-variant-numeric: tabular-nums; padding:2px 8px; border-radius:999px; background:#eee; }
+    .legend { display:flex; gap:8px; align-items:center; font-size:12px; }
+    .sw { width:10px;height:10px;border-radius:50%;display:inline-block;border:2px solid #0002; }
     .leaflet-pane .vehicle-arrow { z-index: 500; }
-    .bus-divicon { pointer-events:auto; } /* keep markers clickable */
-    button { cursor:pointer; }
+    .bus-divicon { pointer-events:auto; }
+    .footer { display:flex; justify-content:space-between; align-items:center; font-size:12px; color:#666; margin-top:10px; }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="sidebar">
-      <h3>London bus routes</h3>
+      <h3 style="margin:6px 0 10px;">London bus routes</h3>
       <div class="row">
-        <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
+        <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:8px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">Tick routes to load vehicles. Polls every 5s; animation tweens smoothly between polls.</div>
-      <div class="muted" style="margin-bottom:6px;">
-        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
-        Stops are white dots with a colored ring. Buses are colored arrows.
+      <div class="muted">Select a route to draw its shape and stops. Live ETAs refresh every 10s.</div>
+      <label class="muted" style="display:flex; align-items:center; gap:8px;">
+        <input type="checkbox" id="showVehicles"> Show approximate bus markers (beta)
+      </label>
+
+      <div class="legend muted" style="margin-top:6px;">
+        <span class="sw" style="background:#2ecc71"></span> &lt; 5m
+        <span class="sw" style="background:#f39c12"></span> 5–10m
+        <span class="sw" style="background:#e74c3c"></span> &gt; 10m
+        <span class="sw" style="background:#bbb"></span> none
       </div>
-      <div id="status" class="loading">Loading routes…</div>
+
+      <div id="status" class="loading" style="margin-top:10px;">Loading routes…</div>
       <div id="routes"></div>
+
+      <div class="section-title">Upcoming arrivals (selected route)</div>
+      <div id="arrivals" class="eta-list muted">Select a route to see live arrivals.</div>
+
+      <div class="footer">
+        <span id="lastUpdated">—</span>
+        <button id="refresh">Refresh</button>
+      </div>
     </div>
     <div id="map" class="map"></div>
   </div>
@@ -46,20 +74,8 @@
     // Config
     // ==============================
     const API = "https://pub-transport-2.onrender.com";
-    const POLL_MS = 5000;
-
-    // Start between stops using ETA vs slice length
-    const AVG_SPEED_MPS = 7;            // ~25 km/h typical moving speed
-    const MIN_SLICE_SEC = 20;           // plausible minimum between stops
-    const MAX_ETA_SEC  = 1800;
-    const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
-
-    // Speed shaping
-    const MAX_FRAC_PER_POLL = 0.12;     // hard cap: progress at most 12% of remaining per poll
-
-    // Staleness tolerance / debouncing
-    const MAX_MISSES = 3;               // keep vehicle for up to 3 missed polls
-    const SLICE_DEBOUNCE = 2;           // need 2 consecutive polls before accepting a slice change
+    const POLL_MS = 10000;
+    const AVG_SPEED_MPS = 7; // for optional approximate markers only
 
     // ==============================
     // DOM/state
@@ -68,12 +84,21 @@
     const searchEl = document.getElementById('search');
     const clearBtn = document.getElementById('clear');
     const statusEl = document.getElementById('status');
+    const arrivalsEl = document.getElementById('arrivals');
+    const lastUpdatedEl = document.getElementById('lastUpdated');
+    const refreshBtn = document.getElementById('refresh');
+    const showVehiclesEl = document.getElementById('showVehicles');
 
     let allRoutes = [];
     let selected = new Set();
     let pollTimer = null;
 
-    // lineId -> { group, vehicles(Map), color, paths/indices }
+    // lineId -> {
+    //   group, color,
+    //   pathIn, cumIn, idxInByStop(Map), stopsIn(Map id->stop), dInByStop(Map id->D),
+    //   pathOut, cumOut, idxOutByStop(Map), stopsOut(Map), dOutByStop(Map),
+    //   vehicleLayer (group for beta markers)
+    // }
     const lineLayers = new Map();
 
     // ==============================
@@ -81,8 +106,7 @@
     // ==============================
     const map = L.map('map').setView([51.5074, -0.1278], 12);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap',
-      maxZoom: 19
+      attribution: '&copy; OpenStreetMap', maxZoom: 19
     }).addTo(map);
 
     // ==============================
@@ -93,8 +117,63 @@
     const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
     const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
     const lerp  = (a,b,t) => a + (b-a)*t;
-    const easeInOut = t => (t<0.5 ? 2*t*t : -1+(4-2*t)*t);
 
+    function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
+    async function fetchJSON(url) {
+      const r = await fetch(url, { mode: "cors", cache: "no-store" });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
+      return r.json();
+    }
+
+    // distances + interpolation
+    function haversineMeters(a,b){ const R=6371000, toRad=x=>x*Math.PI/180;
+      const dLat=toRad(b[0]-a[0]), dLon=toRad(b[1]-a[1]);
+      const lat1=toRad(a[0]), lat2=toRad(b[0]);
+      const s=Math.sin(dLat/2)**2+Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(s));
+    }
+    function cumulativeDistances(points){ const cum=[0]; for(let i=1;i<points.length;i++) cum[i]=cum[i-1]+haversineMeters(points[i-1],points[i]); return cum; }
+    function lowerBound(cum, lo, hi, target) {
+      lo=Math.max(0,lo); hi=Math.min(cum.length-1,hi);
+      while(lo<hi){ const mid=(lo+hi)>>1; if(cum[mid]<target) lo=mid+1; else hi=mid; }
+      return lo;
+    }
+    function pointAtDistanceOnSlice(points, cum, iA, iB, targetD){
+      const i0=Math.min(iA,iB), i1=Math.max(iA,iB);
+      const startD=cum[i0], endD=cum[i1];
+      const tDist=clamp(targetD,startD,endD);
+      const j=lowerBound(cum,i0,i1,tDist);
+      if(j===i0) return points[i0];
+      const segLen=cum[j]-cum[j-1];
+      const segT=segLen>0? (tDist-cum[j-1])/segLen : 0;
+      return [ lerp(points[j-1][0], points[j][0], clamp(segT,0,1)),
+               lerp(points[j-1][1], points[j][1], clamp(segT,0,1)) ];
+    }
+    function headingOnSlice(meta, posD, step=5){
+      const { path, cum, iPrev, iNext } = meta;
+      const dirSign = Math.sign(cum[iNext]-cum[iPrev])||1;
+      const a = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - step*dirSign);
+      const b = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + step*dirSign);
+      const toRad=d=>d*Math.PI/180, toDeg=r=>r*180/Math.PI;
+      const φ1 = toRad(a[0]), φ2 = toRad(b[0]), Δλ = toRad(b[1]-a[1]);
+      const y = Math.sin(Δλ)*Math.cos(φ2);
+      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+      return (toDeg(Math.atan2(y,x))+360)%360;
+    }
+    function projectDistanceOnSlice(points, cum, iPrev, iNext, P){
+      const i0=Math.min(iPrev,iNext), i1=Math.max(iPrev,iNext);
+      let bestD=cum[i0], best=Infinity, toRad=Math.PI/180;
+      for(let j=i0+1;j<=i1;j++){
+        const A=points[j-1], B=points[j];
+        const meanLat=(A[0]+B[0])*0.5*toRad;
+        const bx=(B[1]-A[1])*Math.cos(meanLat), by=(B[0]-A[0]);
+        const px=(P[1]-A[1])*Math.cos(meanLat), py=(P[0]-A[0]);
+        const len2=bx*bx+by*by; let t=len2>0? ((px*bx+py*by)/len2):0; t=clamp(t,0,1);
+        const dx=px-bx*t, dy=py-by*t; const d2=dx*dx+dy*dy;
+        if(d2<best){ best=d2; bestD = cum[j-1] + t*(cum[j]-cum[j-1]); }
+      }
+      return bestD;
+    }
     function busIcon(color, rotationDeg) {
       const html =
         `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
@@ -108,91 +187,18 @@
          </div>`;
       return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
     }
-    function setMarkerRotation(marker, deg) {
-      const el = marker._icon && marker._icon.querySelector('.vehicle-arrow');
-      if (el) el.style.transform = `rotate(${deg}deg)`;
-    }
 
-    async function fetchJSON(url) {
-      const r = await fetch(url, { mode: "cors" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}\n${await r.text()}`);
-      return r.json();
-    }
-    function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
-
-    // ==============================
-    // Polyline helpers
-    // ==============================
-    function haversineMeters(a, b) {
-      const R = 6371000;
-      const toRad = x => x * Math.PI / 180;
-      const dLat = toRad(b[0] - a[0]);
-      const dLon = toRad(b[1] - a[1]);
-      const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
-      const s = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
-      return 2 * R * Math.asin(Math.sqrt(s));
-    }
-    function cumulativeDistances(points) {
-      const cum = [0];
-      for (let i = 1; i < points.length; i++) cum[i] = cum[i-1] + haversineMeters(points[i-1], points[i]);
-      return cum;
-    }
-    function lowerBound(cum, lo, hi, target) {
-      lo = Math.max(0, lo); hi = Math.min(cum.length-1, hi);
-      while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
-      return lo;
-    }
-    function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
-
-    // LatLng at absolute distance D along [i0..i1] (handles reversed order)
-    function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
-      const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
-      const startD = cum[i0], endD = cum[i1];
-      const tDist = clamp(targetD, startD, endD);
-      const j = lowerBound(cum, i0, i1, tDist);
-      if (j === i0) return points[i0];
-      const segLen = cum[j] - cum[j-1];
-      const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
-      return interpPoint(points[j-1], points[j], clamp(segT, 0, 1));
-    }
-
-    // Tangent heading along the polyline at posD
-    function headingOnSlice(meta, posD, stepMeters = 5) {
-      const { path, cum, iPrev, iNext } = meta;
-      const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
-      const a = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - stepMeters * dirSign);
-      const b = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + stepMeters * dirSign);
-      const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
-      const φ1 = toRad(a[0]), φ2 = toRad(b[0]), Δλ = toRad(b[1]-a[1]);
-      const y = Math.sin(Δλ) * Math.cos(φ2);
-      const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-      return (toDeg(Math.atan2(y, x)) + 360) % 360;
-    }
-
-    // Project an arbitrary lat/lon onto the slice (nearest point), returning its distance D on cum
-    function projectDistanceOnSlice(points, cum, iPrev, iNext, P) {
-      const i0 = Math.min(iPrev, iNext), i1 = Math.max(iPrev, iNext);
-      let bestDist2 = Infinity, bestD = cum[i0];
-      const toRad = Math.PI/180;
-      for (let j = i0 + 1; j <= i1; j++) {
-        const A = points[j-1], B = points[j];
-        const meanLat = (A[0] + B[0]) * 0.5 * toRad;
-        const bx = (B[1] - A[1]) * Math.cos(meanLat), by = (B[0] - A[0]);
-        const px = (P[1] - A[1]) * Math.cos(meanLat), py = (P[0] - A[0]);
-        const len2 = bx*bx + by*by;
-        let t = len2 > 0 ? ((px*bx + py*by) / len2) : 0;
-        t = clamp(t, 0, 1);
-        const d2 = (px - bx*t)**2 + (py - by*t)**2;
-        if (d2 < bestDist2) {
-          bestDist2 = d2;
-          bestD = cum[j-1] + t * (cum[j] - cum[j-1]);
-        }
-      }
-      return bestD;
+    function etaBadge(mins){
+      const m = mins;
+      let bg = '#bbb';
+      if (m < 5) bg = '#2ecc71';
+      else if (m < 10) bg = '#f39c12';
+      else if (m !== Infinity) bg = '#e74c3c';
+      return `<span class="eta-badge" style="background:${bg};">${m===Infinity?'—':m+'m'}</span>`;
     }
 
     // ==============================
-    // UI list
+    // UI list + selection
     // ==============================
     function renderRoutes() {
       const q = (searchEl.value || "").trim().toLowerCase();
@@ -231,33 +237,25 @@
       }
     }
 
-    function schedulePolling() {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    clearBtn.addEventListener('click', () => {
+      selected = new Set();
+      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
+      schedulePolling();
+      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+      arrivalsEl.innerHTML = 'Select a route to see live arrivals.';
+      setStatus('No routes selected. Tick some on the left.', 'muted');
+    });
 
-      for (const id of Array.from(lineLayers.keys())) {
-        if (!selected.has(id)) removeRouteLayers(id);
-      }
+    refreshBtn.addEventListener('click', () => {
+      if (selected.size) schedulePolling(); // triggers immediate load
+    });
 
-      if (selected.size === 0) {
-        map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { l.remove(); } catch { map.removeLayer(l); } } });
-        setStatus("No routes selected. Tick some on the left.", "muted");
-        return;
-      }
+    searchEl.addEventListener('input', renderRoutes);
+    showVehiclesEl.addEventListener('change', () => schedulePolling());
 
-      setStatus("Live updating…", "muted");
-
-      const load = async () => {
-        try {
-          await updateVehicles(Array.from(selected));
-        } catch (e) {
-          setStatus("Error: " + e.message, "error");
-        }
-      };
-
-      load();
-      pollTimer = setInterval(load, POLL_MS);
-    }
-
+    // ==============================
+    // Load lines (shapes + stops)
+    // ==============================
     function removeRouteLayers(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
@@ -265,15 +263,12 @@
       lineLayers.delete(lineId);
     }
 
-    // ==============================
-    // Load lines (shape + stops)
-    // ==============================
     async function ensureRouteLoaded(lineId) {
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
 
       const group = L.featureGroup().addTo(map);
-      const vehicles = new Map(); // key -> { marker, meta, misses }
+      const vehicleLayer = L.layerGroup().addTo(group);
 
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
@@ -292,6 +287,7 @@
       const cumIn  = pathIn.length  ? cumulativeDistances(pathIn)  : [];
       const cumOut = pathOut.length ? cumulativeDistances(pathOut) : [];
 
+      // nearest index + projected distance for each stop
       const nearestIndex = (path, stop) => {
         if (!path.length) return null;
         let bestIdx = 0, bestD = Infinity;
@@ -301,249 +297,233 @@
         }
         return bestIdx;
       };
-      const idxInByStop = new Map();
-      const idxOutByStop = new Map();
-      (stops.inbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathIn, sp); if (idx!=null) idxInByStop.set(sp.id, idx); }});
-      (stops.outbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathOut, sp); if (idx!=null) idxOutByStop.set(sp.id, idx); }});
+      const dStopOnPath = (path, cum, idx, stop) => {
+        if (idx == null) return null;
+        const i0 = Math.max(0, idx-3), i1 = Math.min(path.length-1, idx+3);
+        return projectDistanceOnSlice(path, cum, i0, i1, [stop.lat, stop.lon]);
+      };
 
+      const idxInByStop = new Map(), idxOutByStop = new Map();
+      const stopsIn = new Map(), stopsOut = new Map();
+      const dInByStop = new Map(), dOutByStop = new Map();
+
+      (stops.inbound || []).forEach(sp => {
+        if (sp.lat==null || sp.lon==null) return;
+        const idx = nearestIndex(pathIn, sp);
+        if (idx!=null) {
+          idxInByStop.set(sp.id, idx); stopsIn.set(sp.id, sp);
+          dInByStop.set(sp.id, dStopOnPath(pathIn, cumIn, idx, sp));
+        }
+      });
+      (stops.outbound || []).forEach(sp => {
+        if (sp.lat==null || sp.lon==null) return;
+        const idx = nearestIndex(pathOut, sp);
+        if (idx!=null) {
+          idxOutByStop.set(sp.id, idx); stopsOut.set(sp.id, sp);
+          dOutByStop.set(sp.id, dStopOnPath(pathOut, cumOut, idx, sp));
+        }
+      });
+
+      // polylines
       if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
       if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
 
+      // stops (we'll recolor by ETA later)
       const stopsLayer = L.layerGroup().addTo(group);
-      const addStops = (arr) => (arr || []).forEach(sp => {
-        if (sp.lat == null || sp.lon == null) return;
-        L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
-        L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan:false })
-          .addTo(stopsLayer);
-      });
-      addStops(stops.inbound); addStops(stops.outbound);
+      function addStops(arr, dirLabel) {
+        (arr || []).forEach(sp => {
+          if (sp.lat == null || sp.lon == null) return;
+          const ring = L.circleMarker([sp.lat, sp.lon], { radius: 6, color:'#0000', weight:0, fillColor:'#000', fillOpacity:0.08 }).addTo(stopsLayer);
+          const cm = L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor:'#bbb', fillOpacity:1 });
+          cm.bindPopup(`<b>${sp.name || "Stop"}</b><br><small>${dirLabel}</small>`, { autoPan:false });
+          cm.addTo(stopsLayer);
+          sp._ring = ring; sp._cm = cm; // keep refs for recolor
+        });
+      }
+      addStops(stops.inbound, 'Inbound'); addStops(stops.outbound, 'Outbound');
 
+      // fit once
       const allPts = [...pathIn, ...pathOut];
       if (allPts.length) {
         const b = L.latLngBounds(allPts.map(p => L.latLng(p[0], p[1])));
-        map.fitBounds(b, { padding: [20, 20], maxZoom: 14 });
+        map.fitBounds(b, { padding:[20,20], maxZoom:14 });
       }
 
       lineLayers.set(lineId, {
-        group, vehicles, color,
-        pathIn, cumIn, idxInByStop,
-        pathOut, cumOut, idxOutByStop
+        group, color,
+        pathIn, cumIn, idxInByStop, stopsIn, dInByStop,
+        pathOut, cumOut, idxOutByStop, stopsOut, dOutByStop,
+        stopsLayer, vehicleLayer
       });
     }
 
     // ==============================
-    // Vehicles: poll + tween targets
+    // Polling (stable ETAs + optional markers)
     // ==============================
-    async function updateVehicles(lines) {
-      await Promise.all(lines.map(ensureRouteLoaded));
-      await Promise.all(lines.map(loadLine));
+    function schedulePolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+      // remove unselected lines
+      for (const id of Array.from(lineLayers.keys())) {
+        if (!selected.has(id)) removeRouteLayers(id);
+      }
+
+      if (selected.size === 0) {
+        setStatus("No routes selected. Tick some on the left.", "muted");
+        arrivalsEl.innerHTML = 'Select a route to see live arrivals.';
+        lastUpdatedEl.textContent = '—';
+        return;
+      }
+
+      setStatus("Live updating…", "muted");
+
+      const load = async () => {
+        const lines = Array.from(selected);
+        try {
+          await Promise.all(lines.map(ensureRouteLoaded));
+          await Promise.all(lines.map(updateLineETAs));
+          lastUpdatedEl.textContent = "Updated " + new Date().toLocaleTimeString();
+        } catch (e) {
+          setStatus("Error: " + e.message, "error");
+        }
+      };
+
+      load();
+      pollTimer = setInterval(load, POLL_MS);
     }
 
-    function popupHtml(v) {
-      return (
-        `<b>Route:</b> ${v.route}<br>` +
-        `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-        (v.eta_seconds != null ? `<b>ETA:</b> ${Math.max(0, Math.round(v.eta_seconds/60))} min<br>` : "") +
-        `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-      );
+    function recolorStopCircle(stop, mins) {
+      let fill = '#bbb';
+      if (mins < 5) fill = '#2ecc71';
+      else if (mins < 10) fill = '#f39c12';
+      else if (mins !== Infinity) fill = '#e74c3c';
+      if (stop._cm) stop._cm.setStyle({ fillColor: fill });
     }
 
-    // meta per vehicle:
-    // {
-    //   dir, iPrev, iNext, path, cum, color,
-    //   startPosD, targetPosD, animStart, animEnd,
-    //   sliceKey, pendingKey, pendingCount
-    // }
-    async function loadLine(lineId) {
-      const layers = lineLayers.get(lineId);
-      if (!layers) return;
-      const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
+    function busMarkerAt(path, cum, iPrev, iNext, etaSeconds) {
+      // place approx between prev->next using simple speed guess (no tween)
+      const startD = cum[iPrev], endD = cum[iNext];
+      const length = Math.abs(endD - startD);
+      const estDur = Math.max(20, length / AVG_SPEED_MPS);
+      let p = 1 - (etaSeconds / estDur);
+      p = clamp(p, 0.02, 0.98);
+      const dirSign = Math.sign(endD - startD) || 1;
+      const posD = startD + dirSign * (p * length);
+      const latlng = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD);
+      const angle = headingOnSlice({ path, cum, iPrev, iNext }, posD, 5);
+      return { latlng, angle };
+    }
+
+    async function updateLineETAs(lineId) {
+      const LAY = lineLayers.get(lineId);
+      if (!LAY) return;
+
+      const { color, pathIn, cumIn, idxInByStop, stopsIn, dInByStop,
+                      pathOut, cumOut, idxOutByStop, stopsOut, dOutByStop, vehicleLayer } = LAY;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
       const list = data.vehicles || [];
-      const seen = new Set();
 
-      for (const v of list) {
-        const key = vKey(lineId, v.vehicle_id);
-        seen.add(key);
+      // group by next_stop_id
+      const nextByStop = new Map(); // stopId -> [{eta_seconds, direction, vehicle_id, route}]
+      list.forEach(v => {
+        if (!v.next_stop_id || v.eta_seconds == null) return;
+        const arr = nextByStop.get(v.next_stop_id) || [];
+        arr.push(v);
+        nextByStop.set(v.next_stop_id, arr);
+      });
 
-        const hasPrev = (v.prev_stop_id && v.prev_lat != null && v.prev_lon != null);
-        const hasNext = (v.next_stop_id && v.next_lat != null && v.next_lon != null);
-        if (!hasPrev || !hasNext) continue;
+      // Build arrivals table (top 12 soonest across the route)
+      const rows = [];
+      for (const [stopId, arr] of nextByStop.entries()) {
+        const mins = Math.round(Math.min(...arr.map(x => x.eta_seconds)) / 60);
+        const stop = stopsIn.get(stopId) || stopsOut.get(stopId);
+        if (!stop) continue;
+        rows.push({
+          stopId,
+          stopName: stop.name || stopId,
+          mins,
+          count: arr.length,
+          dir: (arr[0]?.direction || '').toLowerCase()
+        });
+      }
+      rows.sort((a,b)=> a.mins - b.mins);
+      arrivalsEl.classList.remove('muted');
+      arrivalsEl.innerHTML = rows.length
+        ? rows.slice(0,12).map(r => (
+            `<div class="eta-row">
+               <div class="eta-stop">
+                 <span class="name">${r.stopName}</span>
+                 <span class="dir">${r.dir || ''} • ${r.count} incoming</span>
+               </div>
+               ${etaBadge(r.mins)}
+             </div>`
+          )).join('')
+        : '<div class="muted">No live arrivals right now.</div>';
 
-        const dir = (v.direction || "").toLowerCase().startsWith("out") ? "outbound" : "inbound";
-        const path = dir === "outbound" ? pathOut : pathIn;
-        const cum  = dir === "outbound" ? cumOut  : cumIn;
-        const idxMap  = dir === "outbound" ? idxOutByStop : idxInByStop;
-        if (!path.length || !cum.length) continue;
-
-        const iPrev = idxMap.get(v.prev_stop_id);
-        const iNext = idxMap.get(v.next_stop_id);
-        if (iPrev == null || iNext == null || iPrev === iNext) continue;
-
-        const startD = cum[iPrev];
-        const endD   = cum[iNext];
-        const length = Math.abs(endD - startD);
-        if (length < 1) continue;
-
-        // Initial placement BETWEEN stops (if we have no prior state)
-        const eta = clamp(v.eta_seconds ?? MIN_SLICE_SEC, 1, MAX_ETA_SEC);
-        const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS);
-        let pNow = 1 - (eta / estDur);
-        pNow = clamp(pNow, START_FRACTION_CLAMP[0], START_FRACTION_CLAMP[1]);
-        const dirSign = Math.sign(endD - startD) || 1;
-        const posNowD = startD + dirSign * (pNow * length);
-
-        let st = vehicles.get(key);
-        const sliceKey = `${dir}|${iPrev}|${iNext}`;
-
-        // function that decides the NEXT TARGET given a current position along slice + eta
-        function computeNextD(curD) {
-          const fracRaw = (POLL_MS / 1000) / Math.max(eta, 1);      // 5 / eta_seconds
-          const frac    = Math.min(fracRaw, MAX_FRAC_PER_POLL);      // cap, no floor
-          let nextD     = curD + (endD - curD) * frac;               // move fraction of remaining
-          if (dirSign > 0) nextD = clamp(nextD, curD, endD);
-          else             nextD = clamp(nextD, endD, curD);
-          return nextD;
-        }
-
-        if (!st) {
-          const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, posNowD, 5);
-          const marker = L.marker(
-            pointAtDistanceOnSlice(path, cum, iPrev, iNext, posNowD),
-            { icon: busIcon(color, angle0) }
-          ).addTo(layers.group).bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
-
-          st = {
-            marker,
-            meta: {
-              dir, iPrev, iNext, path, cum, color,
-              startPosD: posNowD,
-              targetPosD: computeNextD(posNowD),
-              animStart: Date.now(),
-              animEnd:   Date.now() + POLL_MS,
-              sliceKey,
-              pendingKey: null,
-              pendingCount: 0
-            },
-            misses: 0
-          };
-          vehicles.set(key, st);
-        } else {
-          st.misses = 0; // seen this poll
-          st.marker.getPopup()?.setContent(popupHtml(v));
-
-          // Debounce slice changes
-          if (sliceKey !== st.meta.sliceKey) {
-            if (st.meta.pendingKey === sliceKey) st.meta.pendingCount += 1;
-            else { st.meta.pendingKey = sliceKey; st.meta.pendingCount = 1; }
-          } else { st.meta.pendingKey = null; st.meta.pendingCount = 0; }
-
-          const now = Date.now();
-          const tNow = clamp((now - st.meta.animStart) / (st.meta.animEnd - st.meta.animStart), 0, 1);
-          const curD = lerp(st.meta.startPosD, st.meta.targetPosD, easeInOut(tNow));
-
-          const acceptSliceChange =
-            (sliceKey !== st.meta.sliceKey) && (st.meta.pendingCount >= SLICE_DEBOUNCE);
-
-          if (acceptSliceChange) {
-            // continuity: project current marker onto the new slice
-            const curLatLng = st.marker.getLatLng();
-            const startDNew = projectDistanceOnSlice(path, cum, iPrev, iNext, [curLatLng.lat, curLatLng.lng]);
-
-            st.meta = {
-              dir, iPrev, iNext, path, cum, color,
-              startPosD: startDNew,
-              targetPosD: computeNextD(startDNew),
-              animStart: now,
-              animEnd:   now + POLL_MS,
-              sliceKey,
-              pendingKey: null,
-              pendingCount: 0
-            };
-
-            // snap to projected point (tiny move) then continue tween
-            const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, startDNew);
-            const ang= headingOnSlice(st.meta, startDNew, 5);
-            st.marker.setLatLng(ll); setMarkerRotation(st.marker, ang);
-
-          } else {
-            // Same slice: continue from the CURRENT tweened position
-            st.meta = {
-              ...st.meta,
-              startPosD: curD,
-              targetPosD: computeNextD(curD),
-              animStart: now,
-              animEnd:   now + POLL_MS,
-              color
-            };
-          }
-        }
+      // Recolor stop circles by their soonest ETA
+      for (const [id, sp] of stopsIn.entries()) {
+        const arr = nextByStop.get(id);
+        const mins = arr ? Math.round(Math.min(...arr.map(x => x.eta_seconds))/60) : Infinity;
+        recolorStopCircle(sp, mins);
+      }
+      for (const [id, sp] of stopsOut.entries()) {
+        const arr = nextByStop.get(id);
+        const mins = arr ? Math.round(Math.min(...arr.map(x => x.eta_seconds))/60) : Infinity;
+        recolorStopCircle(sp, mins);
       }
 
-      // Stale vehicles: increment misses, delete only after MAX_MISSES
-      for (const [key, st] of Array.from(vehicles.entries())) {
-        if (!seen.has(key)) {
-          st.misses = (st.misses || 0) + 1;
-          if (st.misses >= MAX_MISSES) {
-            try { st.marker.remove(); } catch {}
-            vehicles.delete(key);
-          }
-        }
+      // Optional: approximate bus markers (beta) — refreshed each poll, no tween
+      vehicleLayer.clearLayers();
+      if (showVehiclesEl.checked) {
+        list.forEach(v => {
+          const dirOut = (v.direction || '').toLowerCase().startsWith('out');
+          const path   = dirOut ? pathOut : pathIn;
+          const cum    = dirOut ? cumOut  : cumIn;
+          const idxMap = dirOut ? idxOutByStop : idxInByStop;
+
+          if (!path.length || !cum.length) return;
+          const iPrev = idxMap.get(v.prev_stop_id);
+          const iNext = idxMap.get(v.next_stop_id);
+          if (iPrev == null || iNext == null || iPrev === iNext) return;
+
+          const { latlng, angle } = busMarkerAt(path, cum, iPrev, iNext, v.eta_seconds);
+          const m = L.marker(latlng, { icon: busIcon(color, angle) }).addTo(vehicleLayer);
+          m.bindPopup(
+            `<b>${v.route}</b> • ${v.direction}<br>` +
+            `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}<br>` : ''}` +
+            `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min`,
+            { autoPan:false }
+          );
+        });
       }
     }
 
     // ==============================
-    // Animation loop (tween)
+    // Boot
     // ==============================
-    let rafId = null;
-    function animate() {
-      const now = Date.now();
-      for (const { vehicles } of lineLayers.values()) {
-        for (const st of vehicles.values()) {
-          const m = st.marker, meta = st.meta;
-          if (!meta) continue;
-
-          const { path, cum, iPrev, iNext } = meta;
-          let t = (now - meta.animStart) / (meta.animEnd - meta.animStart);
-          t = clamp(t, 0, 1);
-          const posD = lerp(meta.startPosD, meta.targetPosD, easeInOut(t));
-          const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD);
-          const angle = headingOnSlice(meta, posD, 5);
-
-          m.setLatLng(ll);
-          setMarkerRotation(m, angle);
-        }
-      }
-      rafId = requestAnimationFrame(animate);
-    }
-    rafId = requestAnimationFrame(animate);
-
-    // ==============================
-    // UI wiring & boot
-    // ==============================
-    searchEl.addEventListener('input', renderRoutes);
-    clearBtn.addEventListener('click', () => {
-      selected = new Set();
-      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
-      schedulePolling();
-      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
-    });
-
     (async () => {
       try {
         const data = await fetchJSON(`${API}/routes`);
-        allRoutes = data;
-        setStatus(`Loaded ${allRoutes.length} routes.`);
+        allRoutes = data || [];
+        setStatus(`Loaded ${allRoutes.length} routes.`, 'muted');
         renderRoutes();
       } catch (e) {
         setStatus("Error loading routes: " + e.message, "error");
       }
-      schedulePolling();
     })();
 
-    window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
+    function startPollingIfNeeded() {
+      if (selected.size && !pollTimer) schedulePolling();
+    }
+
+    // When a route gets loaded, start polling and fit once
+    async function ensureAndFocus(lineId){
+      await ensureRouteLoaded(lineId);
+      startPollingIfNeeded();
+    }
+
+    // click events are already wired via checkboxes
   </script>
 </body>
 </html>

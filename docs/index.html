@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (stable motion)</title>
+  <title>London Bus RT – Minimal (solid)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -28,7 +28,7 @@
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">Tick routes to load vehicles. Map updates every 5s.</div>
+      <div class="muted">Tick routes to load vehicles. Map updates every 5s; animation is continuous.</div>
       <div class="muted" style="margin-bottom:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
         Stops are white dots with a colored ring. Buses are colored arrows that move along the route.
@@ -110,6 +110,10 @@
     }
 
     function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
+
+    function normalizeKey(lineId, vehicleId) {
+      return `${String(lineId).trim()}::${String(vehicleId).trim()}`;
+    }
 
     function renderRoutes() {
       const q = (searchEl.value || "").trim().toLowerCase();
@@ -204,7 +208,6 @@
       while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
       return lo;
     }
-    // Works for both forward (iA<iB) and reverse (iA>iB) motion.
     function pointAtDistanceOnAB(points, cum, iA, iB, targetD) {
       const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
       const startD = cum[i0], endD = cum[i1];
@@ -282,7 +285,7 @@
     }
 
     // ==============================
-    // Vehicles: load + animate
+    // Vehicles: poll + maintain segment windows
     // ==============================
     async function updateVehicles(lines) {
       await Promise.all(lines.map(ensureRouteLoaded));
@@ -298,6 +301,13 @@
       );
     }
 
+    function projectNow(meta, nowMs) {
+      const { startMs, endMs, startD, endD } = meta;
+      const dur = Math.max(1, endMs - startMs);
+      const p = Math.max(0, Math.min(1, (nowMs - startMs) / dur));
+      return startD + (endD - startD) * p;
+    }
+
     async function loadLine(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
@@ -306,37 +316,33 @@
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
       const fetchedAtMs = Date.parse(data.fetched_at || new Date().toISOString());
       const vehicles = data.vehicles || [];
-      const seen = new Set();
+      const seenKeys = new Set();
 
       for (const v of vehicles) {
-        const key = `${lineId}::${v.vehicle_id}`;
-        seen.add(key);
+        const key = normalizeKey(lineId, v.vehicle_id);
+        seenKeys.add(key);
 
         const hasPrev = (v.prev_stop_id && v.prev_lat != null && v.prev_lon != null);
         const hasNext = (v.next_stop_id && v.next_lat != null && v.next_lon != null);
         if (!hasPrev || !hasNext) continue;
 
         const dir = (v.direction || "").toLowerCase().startsWith("out") ? "outbound" : "inbound";
-        const usePath = dir === "outbound" ? pathOut : pathIn;
-        const useCum  = dir === "outbound" ? cumOut  : cumIn;
+        const path = dir === "outbound" ? pathOut : pathIn;
+        const cum  = dir === "outbound" ? cumOut  : cumIn;
         const idxMap  = dir === "outbound" ? idxOutByStop : idxInByStop;
 
-        if (!usePath.length || !useCum.length) continue;
+        if (!path.length || !cum.length) continue;
 
         const iPrev = idxMap.get(v.prev_stop_id);
         const iNext = idxMap.get(v.next_stop_id);
         if (iPrev == null || iNext == null || iPrev === iNext) continue;
 
         const rot = bearingDeg(v.prev_lat, v.prev_lon, v.next_lat, v.next_lon);
+        const cumA = cum[iPrev], cumB = cum[iNext];
 
         let st = vehiclesState.get(key);
-        const sameSlice = !!st && st.meta &&
-          st.meta.dir === dir &&
-          st.meta.iPrev === iPrev &&
-          st.meta.iNext === iNext &&
-          st.meta.next_stop_id === v.next_stop_id;
 
-        // Create marker if needed
+        // create marker once
         if (!st) {
           const m = L.marker([v.prev_lat, v.prev_lon], { icon: busIcon(color, rot) }).addTo(layers.group);
           m.bindPopup(popupHtml(v), { autoPan: false, closeButton: true, autoClose: false });
@@ -347,78 +353,80 @@
           st.marker.getPopup()?.setContent(popupHtml(v));
         }
 
-        const cumA = useCum[iPrev];
-        const cumB = useCum[iNext];
-        const sliceLen = Math.abs(cumB - cumA);
-        const sgn = Math.sign(cumB - cumA) || 1; // +1 forward, -1 backward
+        const etaSec = Math.max(1, v.eta_seconds || 1);
+        const newEndMs = fetchedAtMs + etaSec * 1000;
 
-        if (!sameSlice || !st.meta) {
-          // New slice: start just off the previous stop to avoid "stuck" look
-          const progressD = cumA + sgn * Math.min(2, sliceLen * 0.02); // 2m or 2% nudge
-          const speed = sgn * (sliceLen / Math.max(5, v.eta_seconds || 5)); // m/s
+        // Establish / update segment window
+        if (!st.meta) {
           st.meta = {
             dir, iPrev, iNext, next_stop_id: v.next_stop_id,
-            path: usePath, cum: useCum,
-            progressD, speed, lastTickMs: fetchedAtMs
+            path, cum,
+            startMs: fetchedAtMs - 300, // slight head start
+            endMs: newEndMs,
+            startD: cumA,
+            endD: cumB
           };
-          // Place immediately
-          const ll = pointAtDistanceOnAB(st.meta.path, st.meta.cum, iPrev, iNext, progressD);
+          // place immediately at tiny offset from start to avoid "on-stop" look
+          const tiny = Math.max(2, Math.abs(cumB - cumA) * 0.02);
+          const initD = cumA < cumB ? cumA + tiny : cumA - tiny;
+          const ll = pointAtDistanceOnAB(path, cum, iPrev, iNext, initD);
           st.marker.setLatLng(ll);
         } else {
-          // Same slice: keep progress, only adjust speed smoothly (no rewinds)
-          const newSpeedAbs = sliceLen / Math.max(5, v.eta_seconds || 5);
-          const targetSpeed = sgn * newSpeedAbs;
-          // Simple smoothing to avoid jank
-          st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
-          st.meta.dir = dir;
-          st.meta.iPrev = iPrev;
-          st.meta.iNext = iNext;
-          st.meta.next_stop_id = v.next_stop_id;
-          st.meta.path = usePath;
-          st.meta.cum = useCum;
-          // do NOT change progressD here
+          const sameSlice = st.meta.dir === dir && st.meta.iPrev === iPrev && st.meta.iNext === iNext && st.meta.next_stop_id === v.next_stop_id;
+          const now = fetchedAtMs;
+
+          if (sameSlice) {
+            // Keep current progress, only relax/advance endMs
+            const currD = projectNow(st.meta, now);
+            st.meta.startD = currD;
+            st.meta.endD = cumB;
+            st.meta.startMs = now;
+            // if ETA increased, endMs goes later; if it decreased, we bring it forward (no backward jump in distance)
+            st.meta.endMs = newEndMs;
+            st.meta.path = path; st.meta.cum = cum;
+          } else {
+            // New slice: begin from current projected position on old slice, not the stop
+            const currD = projectNow(st.meta, now);
+            st.meta = {
+              dir, iPrev, iNext, next_stop_id: v.next_stop_id,
+              path, cum,
+              startMs: now,
+              endMs: newEndMs,
+              startD: currD,
+              endD: cumB
+            };
+          }
         }
       }
 
       // Remove stale vehicles for this line
-      for (const key of Array.from(vehiclesState.keys())) {
-        if (!seen.has(key)) {
-          vehiclesState.get(key).marker.remove();
+      for (const [key, st] of Array.from(vehiclesState.entries())) {
+        if (!seenKeys.has(key)) {
+          try { st.marker.remove(); } catch {}
           vehiclesState.delete(key);
         }
       }
     }
 
     // ==============================
-    // Animation loop (progressD + speed)
+    // Animation loop (requestAnimationFrame)
     // ==============================
-    setInterval(() => {
+    let rafId = null;
+    function animate() {
       const now = Date.now();
       for (const { vehiclesState } of lineLayers.values()) {
         for (const st of vehiclesState.values()) {
           const { marker, meta } = st;
           if (!meta || !meta.path || !meta.cum) continue;
 
-          const { iPrev, iNext, cum, speed } = meta;
-          if (iPrev == null || iNext == null) continue;
-
-          const cumA = cum[iPrev];
-          const cumB = cum[iNext];
-          const i0 = Math.min(iPrev, iNext), i1 = Math.max(iPrev, iNext);
-          const minD = cum[i0], maxD = cum[i1];
-
-          const dt = Math.max(0, now - (meta.lastTickMs || now)) / 1000.0;
-          meta.lastTickMs = now;
-
-          // advance
-          meta.progressD = Math.max(minD, Math.min(maxD, meta.progressD + speed * dt));
-
-          // place
-          const ll = pointAtDistanceOnAB(meta.path, meta.cum, iPrev, iNext, meta.progressD);
+          const currD = projectNow(meta, now);
+          const ll = pointAtDistanceOnAB(meta.path, meta.cum, meta.iPrev, meta.iNext, currD);
           marker.setLatLng(ll);
         }
       }
-    }, 100); // ~10 fps
+      rafId = requestAnimationFrame(animate);
+    }
+    rafId = requestAnimationFrame(animate);
 
     // ==============================
     // UI wiring & boot
@@ -441,6 +449,9 @@
         setStatus("Error loading routes: " + e.message, "error");
       }
     })();
+
+    // Clean up RAF on unload
+    window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
   </script>
 </body>
 </html>

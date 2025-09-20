@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – No Jumps (debounced + projected)</title>
+  <title>London Bus RT – No Jumps (debounced + projected + sane speed)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; }
@@ -49,14 +49,17 @@
     const POLL_MS = 5000;
 
     // Start between stops using ETA vs slice length
-    const AVG_SPEED_MPS = 7;           // ~25 km/h typical moving speed
-    const MIN_SLICE_SEC = 20;          // plausible minimum between stops
+    const AVG_SPEED_MPS = 7;            // ~25 km/h typical moving speed
+    const MIN_SLICE_SEC = 20;           // plausible minimum between stops
     const MAX_ETA_SEC  = 1800;
     const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
 
-    // Staleness tolerance
-    const MAX_MISSES = 3;              // keep vehicle for up to 3 missed polls
-    const SLICE_DEBOUNCE = 2;          // need 2 consecutive polls before accepting a slice change
+    // Speed shaping
+    const MAX_FRAC_PER_POLL = 0.12;     // hard cap: progress at most 12% of remaining per poll
+
+    // Staleness tolerance / debouncing
+    const MAX_MISSES = 3;               // keep vehicle for up to 3 missed polls
+    const SLICE_DEBOUNCE = 2;           // need 2 consecutive polls before accepting a slice change
 
     // ==============================
     // DOM/state
@@ -174,15 +177,12 @@
       for (let j = i0 + 1; j <= i1; j++) {
         const A = points[j-1], B = points[j];
         const meanLat = (A[0] + B[0]) * 0.5 * toRad;
-        const ax = 0, ay = 0;
         const bx = (B[1] - A[1]) * Math.cos(meanLat), by = (B[0] - A[0]);
         const px = (P[1] - A[1]) * Math.cos(meanLat), py = (P[0] - A[0]);
         const len2 = bx*bx + by*by;
         let t = len2 > 0 ? ((px*bx + py*by) / len2) : 0;
         t = clamp(t, 0, 1);
-        const qx = bx * t, qy = by * t;
-        const dx = px - qx, dy = py - qy;
-        const d2 = dx*dx + dy*dy;
+        const d2 = (px - bx*t)**2 + (py - by*t)**2;
         if (d2 < bestDist2) {
           bestDist2 = d2;
           bestD = cum[j-1] + t * (cum[j] - cum[j-1]);
@@ -273,7 +273,7 @@
       const color = colorFor(lineId);
 
       const group = L.featureGroup().addTo(map);
-      const vehicles = new Map(); // key -> { marker, meta, misses, pendingSlice }
+      const vehicles = new Map(); // key -> { marker, meta, misses }
 
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
@@ -387,7 +387,7 @@
         const length = Math.abs(endD - startD);
         if (length < 1) continue;
 
-        // place BETWEEN stops based on ETA
+        // Initial placement BETWEEN stops (if we have no prior state)
         const eta = clamp(v.eta_seconds ?? MIN_SLICE_SEC, 1, MAX_ETA_SEC);
         const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS);
         let pNow = 1 - (eta / estDur);
@@ -395,31 +395,32 @@
         const dirSign = Math.sign(endD - startD) || 1;
         const posNowD = startD + dirSign * (pNow * length);
 
-        // forward target for next tween window
-        // advance proportionally to ETA so arrival stays on schedule
-        const dt   = POLL_MS / 1000;
-        const frac = Math.min(dt / eta, 1);          // move this fraction of remaining time
-        let nextD  = posNowD + (endD - posNowD) * frac;
-
-        // don't go backwards, don't overshoot end
-        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD);
-        else             nextD = clamp(nextD, endD, posNowD);
-
         let st = vehicles.get(key);
-
         const sliceKey = `${dir}|${iPrev}|${iNext}`;
+
+        // function that decides the NEXT TARGET given a current position along slice + eta
+        function computeNextD(curD) {
+          const fracRaw = (POLL_MS / 1000) / Math.max(eta, 1);      // 5 / eta_seconds
+          const frac    = Math.min(fracRaw, MAX_FRAC_PER_POLL);      // cap, no floor
+          let nextD     = curD + (endD - curD) * frac;               // move fraction of remaining
+          if (dirSign > 0) nextD = clamp(nextD, curD, endD);
+          else             nextD = clamp(nextD, endD, curD);
+          return nextD;
+        }
+
         if (!st) {
           const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, posNowD, 5);
           const marker = L.marker(
             pointAtDistanceOnSlice(path, cum, iPrev, iNext, posNowD),
             { icon: busIcon(color, angle0) }
           ).addTo(layers.group).bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
+
           st = {
             marker,
             meta: {
               dir, iPrev, iNext, path, cum, color,
               startPosD: posNowD,
-              targetPosD: nextD,
+              targetPosD: computeNextD(posNowD),
               animStart: Date.now(),
               animEnd:   Date.now() + POLL_MS,
               sliceKey,
@@ -435,36 +436,26 @@
 
           // Debounce slice changes
           if (sliceKey !== st.meta.sliceKey) {
-            if (st.meta.pendingKey === sliceKey) {
-              st.meta.pendingCount += 1;
-            } else {
-              st.meta.pendingKey = sliceKey;
-              st.meta.pendingCount = 1;
-            }
-          } else {
-            st.meta.pendingKey = null;
-            st.meta.pendingCount = 0;
-          }
+            if (st.meta.pendingKey === sliceKey) st.meta.pendingCount += 1;
+            else { st.meta.pendingKey = sliceKey; st.meta.pendingCount = 1; }
+          } else { st.meta.pendingKey = null; st.meta.pendingCount = 0; }
 
           const now = Date.now();
           const tNow = clamp((now - st.meta.animStart) / (st.meta.animEnd - st.meta.animStart), 0, 1);
           const curD = lerp(st.meta.startPosD, st.meta.targetPosD, easeInOut(tNow));
 
           const acceptSliceChange =
-            (sliceKey !== st.meta.sliceKey) &&
-            (st.meta.pendingCount >= SLICE_DEBOUNCE);
+            (sliceKey !== st.meta.sliceKey) && (st.meta.pendingCount >= SLICE_DEBOUNCE);
 
           if (acceptSliceChange) {
-            // continuity: project current position onto new slice
+            // continuity: project current marker onto the new slice
             const curLatLng = st.marker.getLatLng();
-            const projD = projectDistanceOnSlice(path, cum, iPrev, iNext, [curLatLng.lat, curLatLng.lng]);
-            const startDNew = projD; // closest point on new slice to where we are now
+            const startDNew = projectDistanceOnSlice(path, cum, iPrev, iNext, [curLatLng.lat, curLatLng.lng]);
 
-            // new tween
             st.meta = {
               dir, iPrev, iNext, path, cum, color,
               startPosD: startDNew,
-              targetPosD: nextD,
+              targetPosD: computeNextD(startDNew),
               animStart: now,
               animEnd:   now + POLL_MS,
               sliceKey,
@@ -472,21 +463,17 @@
               pendingCount: 0
             };
 
-            // snap marker to projected point (tiny move) to avoid visible jump
+            // snap to projected point (tiny move) then continue tween
             const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, startDNew);
             const ang= headingOnSlice(st.meta, startDNew, 5);
             st.marker.setLatLng(ll); setMarkerRotation(st.marker, ang);
 
           } else {
-            // Same slice: keep moving forward; start from current interpolated pos
-            let tgt = nextD;
-            if (dirSign > 0) tgt = Math.max(curD, nextD);
-            else             tgt = Math.min(curD, nextD);
-
+            // Same slice: continue from the CURRENT tweened position
             st.meta = {
               ...st.meta,
               startPosD: curD,
-              targetPosD: tgt,
+              targetPosD: computeNextD(curD),
               animStart: now,
               animEnd:   now + POLL_MS,
               color

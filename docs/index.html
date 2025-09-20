@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (smooth + polyline heading)</title>
+  <title>London Bus RT – Minimal (v1 smooth + polyline)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -45,9 +45,9 @@
     // Config
     // ==============================
     const API = "https://pub-transport-2.onrender.com";
-    const AVG_SPEED_MPS = 7;         // ~25 km/h typical moving speed (tweak if you like)
-    const MIN_SLICE_SEC = 20;        // minimum plausible travel time between stops
-    const MAX_ETA_SEC = 1800;        // guardrail
+    const AVG_SPEED_MPS = 7;           // ~25 km/h moving average
+    const MIN_SLICE_SEC = 20;          // plausible minimum between stops
+    const MAX_ETA_SEC = 1800;
     const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
 
     // ==============================
@@ -141,7 +141,7 @@
     function lerp(a,b,t){ return a + (b-a)*t; }
     function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
 
-    // return LatLng at absolute distance D along [i0..i1] (handles reversed order)
+    // LatLng at absolute distance D along [i0..i1] (handles reversed order)
     function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
       const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
       const startD = cum[i0], endD = cum[i1];
@@ -153,7 +153,7 @@
       return interpPoint(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
     }
 
-    // === NEW: heading along the polyline tangent at posD ===
+    // Tangent heading along the polyline at posD
     function headingOnSlice(meta, posD, stepMeters = 5) {
       const { path, cum, iPrev, iNext } = meta;
       const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
@@ -208,7 +208,6 @@
       }
 
       if (selected.size === 0) {
-        // remove all non-tile layers
         map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { l.remove(); } catch { map.removeLayer(l); } } });
         setStatus("No routes selected. Tick some on the left.", "muted");
         return;
@@ -329,7 +328,7 @@
       const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const fetchedAtMs = Date.now();      
+      const fetchedAtMs = Date.now(); // use client clock to avoid skew
       const list = data.vehicles || [];
       const seen = new Set();
 
@@ -355,20 +354,19 @@
         const startD = cum[iPrev];
         const endD   = cum[iNext];
         const length = Math.abs(endD - startD);
-        if (length < 1) continue; // degenerate
+        if (length < 1) continue;
 
         const eta = Math.max(1, Math.min(MAX_ETA_SEC, v.eta_seconds || MIN_SLICE_SEC));
-        const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS); // sec
-        let p0 = 1 - (eta / estDur); // fraction completed toward next stop
+        const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS); // seconds
+        let p0 = 1 - (eta / estDur); // fraction traversed toward next stop
         p0 = Math.max(START_FRACTION_CLAMP[0], Math.min(START_FRACTION_CLAMP[1], p0));
 
         const dirSign = Math.sign(endD - startD) || 1;
-        const inferredPosD = startD + dirSign * (p0 * length); // place between stops using ETA vs length
+        const inferredPosD = startD + dirSign * (p0 * length);
 
         let st = vehicles.get(key);
 
         if (!st) {
-          // Use polyline tangent heading at placement
           const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, inferredPosD, 5);
           const marker = L.marker(
             pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD),
@@ -384,22 +382,22 @@
         const arrivalAt = fetchedAtMs + eta * 1000;
 
         if (!st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext) {
-          // New slice: start from inferredPosD; compute speed to hit end at ETA
+          // New slice starting from inferred position; compute speed to hit end at ETA
           const denom = Math.max(200, arrivalAt - fetchedAtMs); // ms
           const speed = (endD - inferredPosD) / (denom / 1000); // m/s (signed)
           st.meta = {
             dir, iPrev, iNext, path, cum,
-            color,                     // <-- keep line color for animation
+            color,
             posD: inferredPosD,
             speed,
-            lastMs: Date.now(),
+            lastMs: Date.now(), // use client clock
             endD, arrivalAt
           };
         } else {
-          // Same slice: advance to 'now', then retune speed so we still reach endD at new arrivalAt
-          const now =  Date.now();
+          // Same slice: advance to now, then retarget speed to meet new ETA
+          const now = Date.now();
           const dt = Math.max(0, now - st.meta.lastMs) / 1000;
-          st.meta.posD += st.meta.speed * dt; // advance
+          st.meta.posD += st.meta.speed * dt;
           st.meta.lastMs = now;
 
           st.meta.endD = endD;
@@ -415,14 +413,14 @@
           st.meta.posD = Math.max(minD, Math.min(maxD, st.meta.posD));
         }
 
-        // Update marker position + polyline-based heading immediately after poll
+        // Place immediately after poll
         const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
         const angle = headingOnSlice(st.meta, st.meta.posD, 5);
         st.marker.setLatLng(ll);
         st.marker.setIcon(busIcon(color, angle));
       }
 
-      // Remove stale vehicles (no ghosts)
+      // Remove stale vehicles
       for (const [key, st] of Array.from(vehicles.entries())) {
         if (!seen.has(key)) {
           try { st.marker.remove(); } catch {}
@@ -445,12 +443,10 @@
           const dt = Math.max(0, now - meta.lastMs) / 1000;
           meta.lastMs = now;
 
-          // advance along slice
           meta.posD += meta.speed * dt;
 
-          // clamp inside [minD,maxD]
           const startD = meta.cum[meta.iPrev];
-          const endD = meta.cum[meta.iNext];
+          const endD   = meta.cum[meta.iNext];
           const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
           if (meta.posD < minD) meta.posD = minD;
           if (meta.posD > maxD) meta.posD = maxD;
@@ -489,7 +485,6 @@
     })();
 
     window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
-
   </script>
 </body>
 </html>

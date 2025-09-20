@@ -396,10 +396,14 @@
         const posNowD = startD + dirSign * (pNow * length);
 
         // forward target for next tween window
-        const speed = dirSign * (length / estDur);
-        const advance = speed * (POLL_MS / 1000);
-        let nextD = posNowD + advance;
-        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD); else nextD = clamp(nextD, endD, posNowD);
+        // advance proportionally to ETA so arrival stays on schedule
+        const dt   = POLL_MS / 1000;
+        const frac = Math.min(dt / eta, 1);          // move this fraction of remaining time
+        let nextD  = posNowD + (endD - posNowD) * frac;
+
+        // don't go backwards, don't overshoot end
+        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD);
+        else             nextD = clamp(nextD, endD, posNowD);
 
         let st = vehicles.get(key);
 

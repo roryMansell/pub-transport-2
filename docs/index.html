@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (no-reset, clickable)</title>
+  <title>London Bus RT – Tweened (no jumps)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
+    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell; }
     .app { display:flex; height:100%; }
     .sidebar { width:320px; border-right:1px solid #ddd; padding:12px; overflow:auto; }
     .map { flex:1; }
@@ -17,8 +17,7 @@
     .loading { font-size:12px; color:#888; }
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
     .leaflet-pane .vehicle-arrow { z-index: 500; }
-    .bus-divicon { pointer-events: auto; } /* keep markers clickable */
-    button { cursor:pointer; }
+    .bus-divicon { pointer-events:auto; } /* keep markers clickable */
   </style>
 </head>
 <body>
@@ -29,10 +28,10 @@
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
       </div>
-      <div class="muted">Tick routes to load vehicles. Polls every 5s; animation is continuous.</div>
+      <div class="muted">Tick routes to load vehicles. Polls every 5s; animation tweens smoothly between polls.</div>
       <div class="muted" style="margin-bottom:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;vertical-align:middle;margin-right:6px;border:2px solid #0002"></span>
-        Stops are white dots with a colored ring. Buses are colored arrows moving along the route.
+        Stops are white dots with a colored ring. Buses are colored arrows.
       </div>
       <div id="status" class="loading">Loading routes…</div>
       <div id="routes"></div>
@@ -46,8 +45,11 @@
     // Config
     // ==============================
     const API = "https://pub-transport-2.onrender.com";
-    const AVG_SPEED_MPS = 7;              // ~25 km/h moving average
-    const MIN_SLICE_SEC = 20;             // plausible minimum between stops
+    const POLL_MS = 5000;
+
+    // Start between stops using ETA vs slice length
+    const AVG_SPEED_MPS = 7;           // ~25 km/h typical moving speed
+    const MIN_SLICE_SEC = 20;          // plausible minimum between stops
     const MAX_ETA_SEC  = 1800;
     const START_FRACTION_CLAMP = [0.02, 0.98]; // never exactly on a stop
 
@@ -129,9 +131,11 @@
       while (lo < hi) { const mid = (lo+hi)>>1; if (cum[mid] < target) lo = mid+1; else hi = mid; }
       return lo;
     }
-    const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-    const lerp = (a,b,t)=> a + (b-a)*t;
-    const interpPoint = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+    const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+    const lerp  = (a,b,t) => a + (b-a)*t;
+    const easeInOut = t => (t<0.5 ? 2*t*t : -1+(4-2*t)*t); // gentle
+
+    function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
 
     // LatLng at absolute distance D along [i0..i1] (handles reversed order)
     function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
@@ -144,7 +148,6 @@
       const segT = segLen > 0 ? (tDist - cum[j-1]) / segLen : 0;
       return interpPoint(points[j-1], points[j], clamp(segT, 0, 1));
     }
-
     // Tangent heading along the polyline at posD
     function headingOnSlice(meta, posD, stepMeters = 5) {
       const { path, cum, iPrev, iNext } = meta;
@@ -222,7 +225,7 @@
       };
 
       load();
-      pollTimer = setInterval(load, 5000);
+      pollTimer = setInterval(load, POLL_MS);
     }
 
     function removeRouteLayers(lineId) {
@@ -300,7 +303,7 @@
     }
 
     // ==============================
-    // Vehicles: poll + maintain state
+    // Vehicles: poll + tween targets
     // ==============================
     async function updateVehicles(lines) {
       await Promise.all(lines.map(ensureRouteLoaded));
@@ -316,13 +319,17 @@
       );
     }
 
+    // state per vehicle:
+    // meta = {
+    //   dir, iPrev, iNext, path, cum, color,
+    //   startPosD, targetPosD, animStart, animEnd
+    // }
     async function loadLine(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
       const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const fetchedAtMs = Date.now(); // client clock only
       const list = data.vehicles || [];
       const seen = new Set();
 
@@ -338,7 +345,6 @@
         const path = dir === "outbound" ? pathOut : pathIn;
         const cum  = dir === "outbound" ? cumOut  : cumIn;
         const idxMap  = dir === "outbound" ? idxOutByStop : idxInByStop;
-
         if (!path.length || !cum.length) continue;
 
         const iPrev = idxMap.get(v.prev_stop_id);
@@ -350,110 +356,112 @@
         const length = Math.abs(endD - startD);
         if (length < 1) continue;
 
-        // Place BETWEEN stops from ETA vs length
-        const eta    = Math.max(1, Math.min(MAX_ETA_SEC, v.eta_seconds || MIN_SLICE_SEC));
+        // place BETWEEN stops based on ETA
+        const eta = clamp(v.eta_seconds ?? MIN_SLICE_SEC, 1, MAX_ETA_SEC);
         const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS);
-        let p0 = 1 - (eta / estDur);
-        p0 = clamp(p0, START_FRACTION_CLAMP[0], START_FRACTION_CLAMP[1]);
+        let pNow = 1 - (eta / estDur);
+        pNow = clamp(pNow, START_FRACTION_CLAMP[0], START_FRACTION_CLAMP[1]);
         const dirSign = Math.sign(endD - startD) || 1;
-        const inferredPosD = startD + dirSign * (p0 * length);
+        const posNowD = startD + dirSign * (pNow * length);
+
+        // constant avg speed estimate for next interval
+        const speed = dirSign * (length / estDur); // m/s, signed
+        const advance = speed * (POLL_MS / 1000);
+        let nextD = posNowD + advance;
+
+        // don't go backwards, don't overshoot end
+        if (dirSign > 0) nextD = clamp(nextD, posNowD, endD);
+        else             nextD = clamp(nextD, endD, posNowD);
 
         let st = vehicles.get(key);
+
         if (!st) {
-          const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, inferredPosD, 5);
+          // create marker at posNowD with polyline tangent heading
+          const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, posNowD, 5);
           const marker = L.marker(
-            pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD),
+            pointAtDistanceOnSlice(path, cum, iPrev, iNext, posNowD),
             { icon: busIcon(color, angle0) }
-          ).addTo(layers.group)
-           .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
+          ).addTo(layers.group).bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
           st = { marker, meta: null };
           vehicles.set(key, st);
+          // seed tween
+          st.meta = {
+            dir, iPrev, iNext, path, cum, color,
+            startPosD: posNowD,
+            targetPosD: nextD,
+            animStart: Date.now(),
+            animEnd:   Date.now() + POLL_MS
+          };
         } else {
           st.marker.getPopup()?.setContent(popupHtml(v));
-        }
 
-        const now = Date.now();
-        const arrivalAt = fetchedAtMs + eta * 1000;
+          // If slice changed, start new tween from just inside the new slice
+          const sliceChanged = !st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext || st.meta.cum !== cum;
+          if (sliceChanged) {
+            const startDNew = startD;
+            const safeStart = dirSign > 0
+              ? lerp(startDNew, endD, START_FRACTION_CLAMP[0])
+              : lerp(startDNew, endD, 1 - START_FRACTION_CLAMP[0]);
+            st.meta = {
+              dir, iPrev, iNext, path, cum, color,
+              startPosD: safeStart,
+              targetPosD: nextD,
+              animStart: Date.now(),
+              animEnd:   Date.now() + POLL_MS
+            };
+            // snap marker to new slice start (inside a bit) to avoid ghost at stop
+            const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.startPosD);
+            const ang= headingOnSlice(st.meta, st.meta.startPosD, 5);
+            st.marker.setLatLng(ll); setMarkerRotation(st.marker, ang);
+          } else {
+            // Same slice: continue from current interpolated position
+            const now = Date.now();
+            const t = clamp((now - st.meta.animStart) / (st.meta.animEnd - st.meta.animStart), 0, 1);
+            const curD = lerp(st.meta.startPosD, st.meta.targetPosD, easeInOut(t));
 
-        if (!st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext) {
-          // --- slice changed OR first time ---
-          // continuity: if same direction array, start from progressed current pos (never go backwards)
-          let startPos = inferredPosD;
-          if (st.meta && st.meta.cum === cum) {
-            const dt = Math.max(0, now - st.meta.lastMs) / 1000;
-            const progressed = st.meta.posD + st.meta.speed * dt;
-            const newMin = Math.min(startD, endD), newMax = Math.max(startD, endD);
-            const bounded = clamp(progressed, newMin, newMax);
-            startPos = (endD >= startD) ? Math.max(bounded, inferredPosD) : Math.min(bounded, inferredPosD);
+            // New tween: start at current tweened position, target = forward nextD (never backwards)
+            let tgt = nextD;
+            if (dirSign > 0) tgt = Math.max(curD, nextD);
+            else             tgt = Math.min(curD, nextD);
+
+            st.meta = {
+              dir, iPrev, iNext, path, cum, color,
+              startPosD: curD,
+              targetPosD: tgt,
+              animStart: now,
+              animEnd:   now + POLL_MS
+            };
           }
-          const denom = Math.max(200, arrivalAt - now);
-          const speed = (endD - startPos) / (denom / 1000);
-
-          st.meta = {
-            dir, iPrev, iNext, path, cum,
-            color,
-            posD: startPos,
-            speed,
-            lastMs: now,
-            endD, arrivalAt
-          };
-
-          const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
-          const angle = headingOnSlice(st.meta, st.meta.posD, 5);
-          st.marker.setLatLng(ll);
-          setMarkerRotation(st.marker, angle);
-        } else {
-          // --- same slice ---
-          const dt = Math.max(0, now - st.meta.lastMs) / 1000;
-          st.meta.posD += st.meta.speed * dt;
-          st.meta.lastMs = now;
-
-          st.meta.endD = endD;
-          st.meta.arrivalAt = arrivalAt;
-          st.meta.color = color;
-
-          const remainingMs = Math.max(200, arrivalAt - now);
-          const remainingDist = st.meta.endD - st.meta.posD;
-          const targetSpeed = remainingDist / (remainingMs / 1000);
-          st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
-
-          const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
-          st.meta.posD = clamp(st.meta.posD, minD, maxD);
-          // NOTE: no setLatLng here; animation loop handles it → no 5s snap
         }
       }
 
-      // Remove stale vehicles (one missing poll is OK to remove; tweak if needed)
+      // remove stale
       for (const [key, st] of Array.from(vehicles.entries())) {
         if (!seen.has(key)) { try { st.marker.remove(); } catch {} vehicles.delete(key); }
       }
     }
 
     // ==============================
-    // Animation loop (continuous)
+    // Animation loop (tween)
     // ==============================
     let rafId = null;
     function animate() {
       const now = Date.now();
       for (const { vehicles } of lineLayers.values()) {
         for (const st of vehicles.values()) {
-          const { marker, meta } = st;
+          const m = st.marker, meta = st.meta;
           if (!meta) continue;
 
-          const dt = Math.max(0, now - meta.lastMs) / 1000;
-          meta.lastMs = now;
+          const { path, cum, iPrev, iNext } = meta;
+          const startD = cum[iPrev], endD = cum[iNext];
+          let t = (now - meta.animStart) / (meta.animEnd - meta.animStart);
+          t = clamp(t, 0, 1);
+          const posD = lerp(meta.startPosD, meta.targetPosD, easeInOut(t));
+          const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD);
+          const angle = headingOnSlice(meta, posD, 5);
 
-          meta.posD += meta.speed * dt;
-
-          const startD = meta.cum[meta.iPrev];
-          const endD   = meta.cum[meta.iNext];
-          meta.posD = clamp(meta.posD, Math.min(startD,endD), Math.max(startD,endD));
-
-          const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.iPrev, meta.iNext, meta.posD);
-          const angle = headingOnSlice(meta, meta.posD, 5);
-
-          marker.setLatLng(ll);
-          setMarkerRotation(marker, angle);
+          m.setLatLng(ll);
+          setMarkerRotation(m, angle);
         }
       }
       rafId = requestAnimationFrame(animate);
@@ -480,9 +488,8 @@
       } catch (e) {
         setStatus("Error loading routes: " + e.message, "error");
       }
+      schedulePolling();
     })();
-
-    window.addEventListener('beforeunload', () => { if (rafId) cancelAnimationFrame(rafId); });
   </script>
 </body>
 </html>

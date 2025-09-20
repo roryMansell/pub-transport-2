@@ -97,7 +97,7 @@
     //   group, color,
     //   pathIn, cumIn, idxInByStop(Map), stopsIn(Map id->stop), dInByStop(Map id->D),
     //   pathOut, cumOut, idxOutByStop(Map), stopsOut(Map), dOutByStop(Map),
-    //   vehicleLayer (group for beta markers)
+    //   stopsLayer, vehicleLayer
     // }
     const lineLayers = new Map();
 
@@ -237,32 +237,40 @@
       }
     }
 
-    clearBtn.addEventListener('click', () => {
-      selected = new Set();
-      for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
-      schedulePolling();
-      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
-      arrivalsEl.innerHTML = 'Select a route to see live arrivals.';
-      setStatus('No routes selected. Tick some on the left.', 'muted');
-    });
-
-    refreshBtn.addEventListener('click', () => {
-      if (selected.size) schedulePolling(); // triggers immediate load
-    });
-
-    searchEl.addEventListener('input', renderRoutes);
-    showVehiclesEl.addEventListener('change', () => schedulePolling());
-
     // ==============================
-    // Load lines (shapes + stops)
+    // Removal helpers (hard clear)
     // ==============================
     function removeRouteLayers(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
-      try { layers.group.remove(); } catch { map.removeLayer(layers.group); }
+
+      const { group, vehicleLayer, stopsLayer } = layers;
+
+      // Clear child layers first
+      try { vehicleLayer && vehicleLayer.clearLayers && vehicleLayer.clearLayers(); } catch {}
+      try { stopsLayer && stopsLayer.clearLayers && stopsLayer.clearLayers(); } catch {}
+      try { group && group.clearLayers && group.clearLayers(); } catch {}
+
+      // Remove the parent group from the map
+      try { map.removeLayer(group); } catch {}
+      try {
+        map.eachLayer(l => { if (!(l instanceof L.TileLayer) && l === group) map.removeLayer(l); });
+      } catch {}
+
       lineLayers.delete(lineId);
     }
 
+    function hardClearMap() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      for (const id of Array.from(lineLayers.keys())) removeRouteLayers(id);
+      lineLayers.clear();
+      // safety: purge any other non-tile layers
+      map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { map.removeLayer(l); } catch {} } });
+    }
+
+    // ==============================
+    // Load lines (shapes + stops)
+    // ==============================
     async function ensureRouteLoaded(lineId) {
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
@@ -369,6 +377,7 @@
       }
 
       if (selected.size === 0) {
+        hardClearMap();
         setStatus("No routes selected. Tick some on the left.", "muted");
         arrivalsEl.innerHTML = 'Select a route to see live arrivals.';
         lastUpdatedEl.textContent = '—';
@@ -380,9 +389,9 @@
         const lines = Array.from(selected);
         try {
           await Promise.all(lines.map(ensureRouteLoaded));
-          const rowsArrays = await Promise.all(lines.map(updateLineETAs)); // <- now returns rows
+          const rowsArrays = await Promise.all(lines.map(updateLineETAs));
           const allRows = rowsArrays.flat();
-          renderArrivals(allRows); // <- unified arrivals for currently selected lines only
+          renderArrivals(allRows);
           lastUpdatedEl.textContent = "Updated " + new Date().toLocaleTimeString();
         } catch (e) {
           setStatus("Error: " + e.message, "error");
@@ -398,7 +407,11 @@
       if (mins < 5) fill = '#2ecc71';
       else if (mins < 10) fill = '#f39c12';
       else if (mins !== Infinity) fill = '#e74c3c';
-      if (stop._cm) stop._cm.setStyle({ fillColor: fill });
+
+      // Only recolor if the marker is still on the map
+      if (stop._cm && stop._cm._map) {
+        stop._cm.setStyle({ fillColor: fill });
+      }
     }
 
     function busMarkerAt(path, cum, iPrev, iNext, etaSeconds) {
@@ -419,8 +432,8 @@
       const LAY = lineLayers.get(lineId);
       if (!LAY) return [];
 
-      const { color, pathIn, cumIn, idxInByStop, stopsIn, dInByStop,
-                      pathOut, cumOut, idxOutByStop, stopsOut, dOutByStop, vehicleLayer } = LAY;
+      const { color, pathIn, cumIn, idxInByStop, stopsIn,
+                      pathOut, cumOut, idxOutByStop, stopsOut, vehicleLayer } = LAY;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
       const list = data.vehicles || [];
@@ -521,7 +534,24 @@
       )).join('');
     }
 
+    // ==============================
+    // Controls
+    // ==============================
+    clearBtn.addEventListener('click', () => {
+      selected = new Set();
+      hardClearMap();
+      for (const input of routesEl.querySelectorAll('input[type=checkbox]')) input.checked = false;
+      arrivalsEl.innerHTML = 'Select a route to see live arrivals.';
+      setStatus('No routes selected. Tick some on the left.', 'muted');
+      lastUpdatedEl.textContent = '—';
+    });
 
+    refreshBtn.addEventListener('click', () => {
+      if (selected.size) schedulePolling();
+    });
+
+    searchEl.addEventListener('input', renderRoutes);
+    showVehiclesEl.addEventListener('change', () => schedulePolling());
 
     // ==============================
     // Boot
@@ -540,14 +570,10 @@
     function startPollingIfNeeded() {
       if (selected.size && !pollTimer) schedulePolling();
     }
-
-    // When a route gets loaded, start polling and fit once
     async function ensureAndFocus(lineId){
       await ensureRouteLoaded(lineId);
       startPollingIfNeeded();
     }
-
-    // click events are already wired via checkboxes
   </script>
 </body>
 </html>

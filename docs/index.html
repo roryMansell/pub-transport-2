@@ -117,6 +117,7 @@
     const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
     const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
     const lerp  = (a,b,t) => a + (b-a)*t;
+    const normId = x => String(x).trim(); // <— normalize route ids everywhere
 
     function setStatus(msg, css = "loading") { statusEl.className = css; statusEl.textContent = msg; }
     async function fetchJSON(url) {
@@ -216,10 +217,16 @@
 
         const cb = document.createElement('input');
         cb.type = 'checkbox';
-        cb.checked = selected.has(r.id);
+        cb.checked = selected.has(normId(r.id));
         cb.addEventListener('change', () => {
-          if (cb.checked) { selected.add(r.id); ensureRouteLoaded(r.id); }
-          else { selected.delete(r.id); removeRouteLayers(r.id); }
+          const id = normId(r.id);
+          if (cb.checked) {
+            selected.add(id);
+            ensureRouteLoaded(id);
+          } else {
+            selected.delete(id);
+            removeRouteLayers(id);
+          }
           schedulePolling();
         });
 
@@ -240,18 +247,17 @@
     // ==============================
     // Removal helpers (hard clear)
     // ==============================
-    function removeRouteLayers(lineId) {
+    function removeRouteLayers(lineIdRaw) {
+      const lineId = normId(lineIdRaw);
       const layers = lineLayers.get(lineId);
       if (!layers) return;
 
       const { group, vehicleLayer, stopsLayer } = layers;
 
-      // Clear child layers first
       try { vehicleLayer && vehicleLayer.clearLayers && vehicleLayer.clearLayers(); } catch {}
       try { stopsLayer && stopsLayer.clearLayers && stopsLayer.clearLayers(); } catch {}
       try { group && group.clearLayers && group.clearLayers(); } catch {}
 
-      // Remove the parent group from the map
       try { map.removeLayer(group); } catch {}
       try {
         map.eachLayer(l => { if (!(l instanceof L.TileLayer) && l === group) map.removeLayer(l); });
@@ -264,14 +270,14 @@
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       for (const id of Array.from(lineLayers.keys())) removeRouteLayers(id);
       lineLayers.clear();
-      // safety: purge any other non-tile layers
       map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { map.removeLayer(l); } catch {} } });
     }
 
     // ==============================
     // Load lines (shapes + stops)
     // ==============================
-    async function ensureRouteLoaded(lineId) {
+    async function ensureRouteLoaded(lineIdRaw) {
+      const lineId = normId(lineIdRaw);
       if (lineLayers.has(lineId)) return;
       const color = colorFor(lineId);
 
@@ -371,9 +377,9 @@
     function schedulePolling() {
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 
-      // remove unselected lines immediately
+      // remove unselected lines immediately (normalized)
       for (const id of Array.from(lineLayers.keys())) {
-        if (!selected.has(id)) removeRouteLayers(id);
+        if (!selected.has(normId(id))) removeRouteLayers(id);
       }
 
       if (selected.size === 0) {
@@ -408,14 +414,12 @@
       else if (mins < 10) fill = '#f39c12';
       else if (mins !== Infinity) fill = '#e74c3c';
 
-      // Only recolor if the marker is still on the map
       if (stop._cm && stop._cm._map) {
         stop._cm.setStyle({ fillColor: fill });
       }
     }
 
     function busMarkerAt(path, cum, iPrev, iNext, etaSeconds) {
-      // place approx between prev->next using simple speed guess (no tween)
       const startD = cum[iPrev], endD = cum[iNext];
       const length = Math.abs(endD - startD);
       const estDur = Math.max(20, length / AVG_SPEED_MPS);
@@ -428,7 +432,8 @@
       return { latlng, angle };
     }
 
-    async function updateLineETAs(lineId) {
+    async function updateLineETAs(lineIdRaw) {
+      const lineId = normId(lineIdRaw);
       const LAY = lineLayers.get(lineId);
       if (!LAY) return [];
 
@@ -470,7 +475,6 @@
           const iNext = idxMap.get(v.next_stop_id);
           if (iPrev == null || iNext == null || iPrev === iNext) return;
 
-          // simple placement (no tween)
           const startD = cum[iPrev], endD = cum[iNext];
           const length = Math.abs(endD - startD);
           const estDur = Math.max(20, length / AVG_SPEED_MPS);
@@ -492,14 +496,14 @@
         });
       }
 
-      // build rows for THIS line; schedulePolling() will combine all selected lines
+      // build rows for THIS line
       const rows = [];
       for (const [stopId, arr] of nextByStop.entries()) {
         const mins = Math.round(Math.min(...arr.map(x => x.eta_seconds)) / 60);
         const stop = stopsIn.get(stopId) || stopsOut.get(stopId);
         if (!stop) continue;
         rows.push({
-          lineId,
+          lineId, // normalized id
           stopId,
           stopName: stop.name || stopId,
           mins,
@@ -513,7 +517,7 @@
     function renderArrivals(rows) {
       // only show arrivals for currently selected lines
       const selectedIds = new Set(selected);
-      const filtered = rows.filter(r => selectedIds.has(r.lineId));
+      const filtered = rows.filter(r => selectedIds.has(normId(r.lineId)));
       filtered.sort((a,b)=> a.mins - b.mins);
 
       if (!filtered.length) {

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (smooth + correct start)</title>
+  <title>London Bus RT – Minimal (smooth + polyline heading)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -153,13 +153,13 @@
       return interpPoint(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
     }
 
-    // small step ahead/behind along slice, for heading
-    function pointAheadBehind(meta, posD, stepMeters) {
+    // === NEW: heading along the polyline tangent at posD ===
+    function headingOnSlice(meta, posD, stepMeters = 5) {
       const { path, cum, iPrev, iNext } = meta;
       const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
-      const pBehind = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - stepMeters*dirSign);
-      const pAhead  = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + stepMeters*dirSign);
-      return { pBehind, pAhead };
+      const a = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD - stepMeters * dirSign);
+      const b = pointAtDistanceOnSlice(path, cum, iPrev, iNext, posD + stepMeters * dirSign);
+      return bearingDeg(a[0], a[1], b[0], b[1]);
     }
 
     // ==============================
@@ -366,12 +366,15 @@
         const inferredPosD = startD + dirSign * (p0 * length); // place between stops using ETA vs length
 
         let st = vehicles.get(key);
-        const rot = bearingDeg(v.prev_lat, v.prev_lon, v.next_lat, v.next_lon);
 
         if (!st) {
-          const marker = L.marker(pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD), { icon: busIcon(color, rot) })
-            .addTo(layers.group)
-            .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
+          // Use polyline tangent heading at placement
+          const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, inferredPosD, 5);
+          const marker = L.marker(
+            pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD),
+            { icon: busIcon(color, angle0) }
+          ).addTo(layers.group)
+           .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
           st = { marker, meta: null };
           vehicles.set(key, st);
         } else {
@@ -386,6 +389,7 @@
           const speed = (endD - inferredPosD) / (denom / 1000); // m/s (signed)
           st.meta = {
             dir, iPrev, iNext, path, cum,
+            color,                     // <-- keep line color for animation
             posD: inferredPosD,
             speed,
             lastMs: fetchedAtMs,
@@ -400,24 +404,22 @@
 
           st.meta.endD = endD;
           st.meta.arrivalAt = arrivalAt;
+          st.meta.color = color;
 
           const remainingMs = Math.max(200, arrivalAt - now);
           const remainingDist = st.meta.endD - st.meta.posD;
-          // smooth speed change to avoid jolts
           const targetSpeed = remainingDist / (remainingMs / 1000);
           st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
 
-          // keep within slice limits
           const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
           st.meta.posD = Math.max(minD, Math.min(maxD, st.meta.posD));
         }
 
-        // Update marker position + heading right away
+        // Update marker position + polyline-based heading immediately after poll
         const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
-        const { pBehind, pAhead } = pointAheadBehind(st.meta, st.meta.posD, 3); // 3m step for heading
-        const hdg = bearingDeg(pBehind[0], pBehind[1], pAhead[0], pAhead[1]);
+        const angle = headingOnSlice(st.meta, st.meta.posD, 5);
         st.marker.setLatLng(ll);
-        st.marker.setIcon(busIcon(color, hdg));
+        st.marker.setIcon(busIcon(color, angle));
       }
 
       // Remove stale vehicles (no ghosts)
@@ -454,12 +456,10 @@
           if (meta.posD > maxD) meta.posD = maxD;
 
           const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.iPrev, meta.iNext, meta.posD);
-          const { pBehind, pAhead } = pointAheadBehind(meta, meta.posD, 3);
-          const hdg = bearingDeg(pBehind[0], pBehind[1], pAhead[0], pAhead[1]);
+          const angle = headingOnSlice(meta, meta.posD, 5);
 
           marker.setLatLng(ll);
-          marker.setIcon(busIcon(marker.options.icon.options.html.includes('border-bottom') ? '#000' : '#000', hdg)); // keep rotation
-          // ^^ We re-create icon only to update rotation; color is baked in HTML, so we keep it black in style above.
+          marker.setIcon(busIcon(meta.color || '#000', angle));
         }
       }
       rafId = requestAnimationFrame(animate);

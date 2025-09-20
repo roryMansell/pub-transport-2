@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal (v1 smooth + polyline)</title>
+  <title>London Bus RT – Minimal (v1 stable + clickable)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -17,13 +17,15 @@
     .loading { font-size:12px; color:#888; }
     .error { color:#b00020; font-size:12px; white-space:pre-wrap; }
     .leaflet-pane .vehicle-arrow { z-index: 500; }
+    /* ensure the marker DOM accepts clicks */
+    .bus-divicon { pointer-events: auto; }
     button { cursor:pointer; }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="sidebar">
-      <h3>London bus routes</h3>
+      <h3>London bus routes V1</h3>
       <div class="row">
         <input id="search" placeholder="Search route (e.g. 88, 214, N5)" style="flex:1; padding:6px;">
         <button id="clear">Clear</button>
@@ -85,10 +87,11 @@
     const colorFor = (lineId) => `hsl(${hash(lineId)%360}, 75%, 45%)`;
     const vKey = (lineId, vid) => `${String(lineId).trim()}::${String(vid).trim()}`;
 
+    // Create icon once; we rotate by mutating the DOM, not recreating it
     function busIcon(color, rotationDeg) {
       const html =
         `<div class="vehicle-arrow" style="transform: rotate(${rotationDeg}deg); transform-origin: 50% 50%;">
-           <div style="
+           <div class="arrow-core" style="
              width:0; height:0;
              border-left:9px solid transparent;
              border-right:9px solid transparent;
@@ -97,6 +100,10 @@
            "></div>
          </div>`;
       return L.divIcon({ className: 'bus-divicon', html, iconSize: [20,20], iconAnchor: [10,10] });
+    }
+    function setMarkerRotation(marker, deg) {
+      const el = marker._icon && marker._icon.querySelector('.vehicle-arrow');
+      if (el) el.style.transform = `rotate(${deg}deg)`;
     }
 
     function bearingDeg(lat1, lon1, lat2, lon2) {
@@ -141,7 +148,6 @@
     function lerp(a,b,t){ return a + (b-a)*t; }
     function interpPoint(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]; }
 
-    // LatLng at absolute distance D along [i0..i1] (handles reversed order)
     function pointAtDistanceOnSlice(points, cum, iA, iB, targetD) {
       const i0 = Math.min(iA, iB), i1 = Math.max(iA, iB);
       const startD = cum[i0], endD = cum[i1];
@@ -153,7 +159,6 @@
       return interpPoint(points[j-1], points[j], Math.max(0, Math.min(1, segT)));
     }
 
-    // Tangent heading along the polyline at posD
     function headingOnSlice(meta, posD, stepMeters = 5) {
       const { path, cum, iPrev, iNext } = meta;
       const dirSign = Math.sign(cum[iNext] - cum[iPrev]) || 1;
@@ -262,7 +267,6 @@
       const cumIn  = pathIn.length  ? cumulativeDistances(pathIn)  : [];
       const cumOut = pathOut.length ? cumulativeDistances(pathOut) : [];
 
-      // map stop id -> nearest index on its direction path
       const nearestIndex = (path, stop) => {
         if (!path.length) return null;
         let bestIdx = 0, bestD = Infinity;
@@ -280,7 +284,6 @@
       if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
       if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
 
-      // stops layer
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => (arr || []).forEach(sp => {
         if (sp.lat == null || sp.lon == null) return;
@@ -291,7 +294,6 @@
       });
       addStops(stops.inbound); addStops(stops.outbound);
 
-      // fit once
       const allPts = [...pathIn, ...pathOut];
       if (allPts.length) {
         const b = L.latLngBounds(allPts.map(p => L.latLng(p[0], p[1])));
@@ -360,7 +362,6 @@
         const estDur = Math.max(MIN_SLICE_SEC, length / AVG_SPEED_MPS); // seconds
         let p0 = 1 - (eta / estDur); // fraction traversed toward next stop
         p0 = Math.max(START_FRACTION_CLAMP[0], Math.min(START_FRACTION_CLAMP[1], p0));
-
         const dirSign = Math.sign(endD - startD) || 1;
         const inferredPosD = startD + dirSign * (p0 * length);
 
@@ -370,7 +371,7 @@
           const angle0 = headingOnSlice({ path, cum, iPrev, iNext }, inferredPosD, 5);
           const marker = L.marker(
             pointAtDistanceOnSlice(path, cum, iPrev, iNext, inferredPosD),
-            { icon: busIcon(color, angle0) }
+            { icon: busIcon(color, angle0) } // create ONCE
           ).addTo(layers.group)
            .bindPopup(popupHtml(v), { autoPan:false, closeButton:true, autoClose:false });
           st = { marker, meta: null };
@@ -382,19 +383,24 @@
         const arrivalAt = fetchedAtMs + eta * 1000;
 
         if (!st.meta || st.meta.dir !== dir || st.meta.iPrev !== iPrev || st.meta.iNext !== iNext) {
-          // New slice starting from inferred position; compute speed to hit end at ETA
-          const denom = Math.max(200, arrivalAt - fetchedAtMs); // ms
-          const speed = (endD - inferredPosD) / (denom / 1000); // m/s (signed)
+          // New slice: set starting position; compute speed to meet ETA
+          const denom = Math.max(200, arrivalAt - fetchedAtMs);
+          const speed = (endD - inferredPosD) / (denom / 1000);
           st.meta = {
             dir, iPrev, iNext, path, cum,
             color,
             posD: inferredPosD,
             speed,
-            lastMs: Date.now(), // use client clock
+            lastMs: Date.now(),
             endD, arrivalAt
           };
+          // place & rotate NOW (only on new slice or marker create)
+          const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
+          const angle = headingOnSlice(st.meta, st.meta.posD, 5);
+          st.marker.setLatLng(ll);
+          setMarkerRotation(st.marker, angle);
         } else {
-          // Same slice: advance to now, then retarget speed to meet new ETA
+          // Same slice: advance to now, re-target speed; DO NOT reset posD
           const now = Date.now();
           const dt = Math.max(0, now - st.meta.lastMs) / 1000;
           st.meta.posD += st.meta.speed * dt;
@@ -409,15 +415,11 @@
           const targetSpeed = remainingDist / (remainingMs / 1000);
           st.meta.speed = st.meta.speed * 0.6 + targetSpeed * 0.4;
 
+          // clamp within the slice
           const minD = Math.min(startD, endD), maxD = Math.max(startD, endD);
           st.meta.posD = Math.max(minD, Math.min(maxD, st.meta.posD));
+          // NO setLatLng here → avoids 5s "snap"
         }
-
-        // Place immediately after poll
-        const ll = pointAtDistanceOnSlice(path, cum, iPrev, iNext, st.meta.posD);
-        const angle = headingOnSlice(st.meta, st.meta.posD, 5);
-        st.marker.setLatLng(ll);
-        st.marker.setIcon(busIcon(color, angle));
       }
 
       // Remove stale vehicles
@@ -455,7 +457,7 @@
           const angle = headingOnSlice(meta, meta.posD, 5);
 
           marker.setLatLng(ll);
-          marker.setIcon(busIcon(meta.color || '#000', angle));
+          setMarkerRotation(marker, angle); // rotate without recreating icon
         }
       }
       rafId = requestAnimationFrame(animate);
@@ -465,7 +467,8 @@
     // ==============================
     // UI wiring & boot
     // ==============================
-    searchEl.addEventListener('input', renderRoutes);
+    function renderRoutesList() { renderRoutes(); } // alias
+    searchEl.addEventListener('input', renderRoutesList);
     clearBtn.addEventListener('click', () => {
       selected = new Set();
       for (const lineId of Array.from(lineLayers.keys())) removeRouteLayers(lineId);
@@ -478,7 +481,7 @@
         const data = await fetchJSON(`${API}/routes`);
         allRoutes = data;
         setStatus(`Loaded ${allRoutes.length} routes.`);
-        renderRoutes();
+        renderRoutesList();
       } catch (e) {
         setStatus("Error loading routes: " + e.message, "error");
       }

@@ -329,7 +329,7 @@
       const { vehicles, color, pathIn, cumIn, idxInByStop, pathOut, cumOut, idxOutByStop } = layers;
 
       const data = await fetchJSON(`${API}/vehicles?line_id=${encodeURIComponent(lineId)}`);
-      const fetchedAtMs = Date.parse(data.fetched_at || new Date().toISOString());
+      const fetchedAtMs = Date.now();      
       const list = data.vehicles || [];
       const seen = new Set();
 
@@ -392,12 +392,12 @@
             color,                     // <-- keep line color for animation
             posD: inferredPosD,
             speed,
-            lastMs: fetchedAtMs,
+            lastMs: Date.now(),
             endD, arrivalAt
           };
         } else {
           // Same slice: advance to 'now', then retune speed so we still reach endD at new arrivalAt
-          const now = fetchedAtMs;
+          const now =  Date.now();
           const dt = Math.max(0, now - st.meta.lastMs) / 1000;
           st.meta.posD += st.meta.speed * dt; // advance
           st.meta.lastMs = now;

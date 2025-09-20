@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>London Bus RT – Minimal</title>
+  <title>London Bus RT – Minimal (fixed)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial; }
@@ -148,15 +148,19 @@
 
     function schedulePolling() {
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-      // remove lines no longer selected
-      for (const lineId of Array.from(lineLayers.keys())) {
-        if (!selected.has(lineId)) removeRouteLayers(lineId);
+
+      for (const id of Array.from(lineLayers.keys())) {
+        if (!selected.has(id)) removeRouteLayers(id);
       }
+
       if (selected.size === 0) {
+        map.eachLayer(l => { if (!(l instanceof L.TileLayer)) { try { l.remove(); } catch { map.removeLayer(l); } } });
         setStatus("No routes selected. Tick some on the left.", "muted");
         return;
       }
+
       setStatus("Live updating…", "muted");
+
       const load = async () => {
         const lines = Array.from(selected);
         try {
@@ -165,6 +169,7 @@
           setStatus("Error: " + e.message, "error");
         }
       };
+
       load();
       pollTimer = setInterval(load, 5000);
     }
@@ -172,13 +177,8 @@
     function removeRouteLayers(lineId) {
       const layers = lineLayers.get(lineId);
       if (!layers) return;
-      try {
-        if (layers.group && layers.group.clearLayers) layers.group.clearLayers();
-        if (map.hasLayer(layers.group)) map.removeLayer(layers.group);
-      } finally {
-        if (layers.vehiclesState && layers.vehiclesState.clear) layers.vehiclesState.clear();
-        lineLayers.delete(lineId);
-      }
+      try { layers.group.remove(); } catch { map.removeLayer(layers.group); }
+      lineLayers.delete(lineId);
     }
 
     // ==============================
@@ -225,13 +225,11 @@
       const group = L.featureGroup().addTo(map);
       const vehiclesState = new Map();
 
-      // 1) Shape + 2) Stops
       const [shape, stops] = await Promise.all([
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/shape`),
         fetchJSON(`${API}/line/${encodeURIComponent(lineId)}/stops`)
       ]);
 
-      // choose longest segment for each direction
       const pickPath = (segments) => {
         let best = null;
         for (const s of (segments || [])) if (Array.isArray(s) && s.length >= 2) best = !best || s.length > best.length ? s : best;
@@ -243,7 +241,6 @@
       const cumIn  = pathIn.length  ? cumulativeDistances(pathIn)  : [];
       const cumOut = pathOut.length ? cumulativeDistances(pathOut) : [];
 
-      // map stop id -> nearest index on its direction path
       const nearestIndex = (path, stop) => {
         if (!path.length) return null;
         let bestIdx = 0, bestD = Infinity;
@@ -258,21 +255,19 @@
       (stops.inbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathIn, sp); if (idx!=null) idxInByStop.set(sp.id, idx); }});
       (stops.outbound || []).forEach(sp => { if (sp.lat!=null && sp.lon!=null) { const idx = nearestIndex(pathOut, sp); if (idx!=null) idxOutByStop.set(sp.id, idx); }});
 
-      // draw polylines
       if (pathIn.length)  L.polyline(pathIn,  { color, weight: 4, opacity: 0.85 }).addTo(group);
       if (pathOut.length) L.polyline(pathOut, { color, weight: 4, opacity: 0.55, dashArray: "6,6" }).addTo(group);
 
-      // stops on top
       const stopsLayer = L.layerGroup().addTo(group);
       const addStops = (arr) => (arr || []).forEach(sp => {
         if (sp.lat == null || sp.lon == null) return;
         L.circleMarker([sp.lat, sp.lon], { radius: 6, color: '#0000', weight: 0, fillColor: '#000', fillOpacity: 0.08 }).addTo(stopsLayer);
-        L.circleMarker([sp.lat, sp.lon], { radius: 5, color: color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
-          .bindPopup(`<b>${sp.name || "Stop"}</b>`).addTo(stopsLayer);
+        L.circleMarker([sp.lat, sp.lon], { radius: 5, color, weight: 3, fillColor: '#fff', fillOpacity: 1.0 })
+          .bindPopup(`<b>${sp.name || "Stop"}</b>`, { autoPan: false }) // no camera nudge on stop popups either
+          .addTo(stopsLayer);
       });
       addStops(stops.inbound); addStops(stops.outbound);
 
-      // fit once
       const allPts = [...pathIn, ...pathOut];
       if (allPts.length) {
         const b = L.latLngBounds(allPts.map(p => L.latLng(p[0], p[1])));
@@ -291,6 +286,15 @@
     async function updateVehicles(lines) {
       await Promise.all(lines.map(ensureRouteLoaded));
       await Promise.all(lines.map(loadLine));
+    }
+
+    function popupHtml(v) {
+      return (
+        `<b>Route:</b> ${v.route}<br>` +
+        `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
+        (v.eta_seconds != null ? `<b>ETA:</b> ${Math.max(0, Math.round(v.eta_seconds/60))} min<br>` : "") +
+        `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
+      );
     }
 
     async function loadLine(lineId) {
@@ -320,8 +324,7 @@
 
         const iPrev = idxMap.get(v.prev_stop_id);
         const iNext = idxMap.get(v.next_stop_id);
-        if (iPrev == null || iNext == null) continue;
-        if (iNext === iPrev) continue;
+        if (iPrev == null || iNext == null || iNext === iPrev) continue;
 
         const i0 = Math.min(iPrev, iNext);
         const i1 = Math.max(iPrev, iNext);
@@ -329,47 +332,44 @@
         const rot = bearingDeg(v.prev_lat, v.prev_lon, v.next_lat, v.next_lon);
 
         let st = vehiclesState.get(key);
+        const sameTarget = !!st && st.meta && st.meta.next_stop_id === v.next_stop_id && st.meta.dir === dir;
+
         if (!st) {
           const m = L.marker([v.prev_lat, v.prev_lon], { icon: busIcon(color, rot) }).addTo(layers.group);
-          m.bindPopup(
-            `<b>Route:</b> ${v.route}<br>` +
-            `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-            `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
-            `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-          );
+          // Disable popup autoPan so the map doesn't keep snapping when the marker moves
+          m.bindPopup(popupHtml(v), { autoPan: false, closeButton: true, autoClose: false });
           st = { marker: m, meta: {} };
           vehiclesState.set(key, st);
         } else {
           st.marker.setIcon(busIcon(color, rot));
-          st.marker.getPopup()?.setContent(
-            `<b>Route:</b> ${v.route}<br>` +
-            `<b>Vehicle:</b> ${v.vehicle_id}<br>` +
-            `<b>ETA:</b> ${Math.round(v.eta_seconds/60)} min<br>` +
-            `${v.next_stop_name ? `<b>Next stop:</b> ${v.next_stop_name}` : ""}`
-          );
+          st.marker.getPopup()?.setContent(popupHtml(v));
         }
 
-        const sameTarget = st.meta.next_stop_id === v.next_stop_id && st.meta.dir === dir;
+        // Establish or update timing window
+        const nowSegChanged = !sameTarget;
+        if (nowSegChanged) {
+          // New segment window [startMs, endMs]
+          const startMs = fetchedAtMs - 500; // tiny head start so it doesn't "stick"
+          const endMs   = fetchedAtMs + Math.max(1, v.eta_seconds || 1) * 1000;
+          st.meta = {
+            dir, path: usePath, cum: useCum, i0, i1,
+            next_stop_id: v.next_stop_id,
+            startMs, endMs
+          };
 
-        st.meta = {
-          dir,
-          path: usePath,
-          cum: useCum,
-          i0, i1,
-          next_stop_id: v.next_stop_id,
-          seg_duration: Math.max(v.eta_seconds, 1),
-          last_eta: v.eta_seconds,
-          last_update_ms: fetchedAtMs
-        };
-
-        // on new segment, place roughly at current progress
-        if (!sameTarget) {
-          const p = 1 - (v.eta_seconds / st.meta.seg_duration);
+          // Place at the start of the new slice (previous stop)
           const startD = st.meta.cum[i0];
-          const endD   = st.meta.cum[i1];
-          const target = startD + Math.max(0, Math.min(1, p)) * (endD - startD);
-          const pt = pointAtDistanceOnSlice(st.meta.path, st.meta.cum, i0, i1, target);
-          st.marker.setLatLng(pt);
+          const ll = pointAtDistanceOnSlice(st.meta.path, st.meta.cum, i0, i1, startD);
+          st.marker.setLatLng(ll);
+        } else {
+          // Same segment: keep startMs to preserve progress. Optionally relax endMs to new ETA if it's later.
+          const suggestedEnd = fetchedAtMs + Math.max(1, v.eta_seconds || 1) * 1000;
+          if (suggestedEnd > st.meta.endMs) {
+            st.meta.endMs = suggestedEnd; // arrival pushed back -> slow down smoothly
+          }
+          // If suggestedEnd is earlier, we keep the old endMs so the bus gently “catches up” instead of snapping back.
+          // Update path indices in case stop->polyline mapping changed slightly
+          st.meta.i0 = i0; st.meta.i1 = i1; st.meta.path = usePath; st.meta.cum = useCum;
         }
       }
 
@@ -382,21 +382,20 @@
       }
     }
 
-    // animation loop — advance along polyline slices
+    // animation loop — advance along polyline slices with stable timing
     setInterval(() => {
       const now = Date.now();
       for (const { vehiclesState } of lineLayers.values()) {
         for (const st of vehiclesState.values()) {
           const { marker, meta } = st;
-          if (!meta || !meta.path || !meta.cum || meta.i0 == null || meta.i1 == null) continue;
+          if (!meta || !meta.path || !meta.cum || meta.i0 == null || meta.i1 == null || meta.startMs == null || meta.endMs == null) continue;
 
-          const elapsed = (now - meta.last_update_ms) / 1000;
-          const remaining = Math.max(0, meta.last_eta - elapsed);
-          const p = 1 - (remaining / meta.seg_duration);
+          const dur = Math.max(1, meta.endMs - meta.startMs);
+          const p = Math.max(0, Math.min(1, (now - meta.startMs) / dur));
 
           const startD = meta.cum[meta.i0];
           const endD   = meta.cum[meta.i1];
-          const target = startD + Math.max(0, Math.min(1, p)) * (endD - startD);
+          const target = startD + p * (endD - startD);
           const ll = pointAtDistanceOnSlice(meta.path, meta.cum, meta.i0, meta.i1, target);
           marker.setLatLng(ll);
         }
